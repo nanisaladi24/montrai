@@ -11,9 +11,8 @@ import time
 import sys
 from datetime import datetime
 
-from config.settings import (
-    WATCHLIST, SIGNAL_INTERVAL_MINUTES, TRADING_MODE
-)
+from config.settings import TRADING_MODE
+import config.runtime_config as rc
 from core.market_data import fetch_historical, latest_quote, is_market_open
 from core.feature_engineering import build_hmm_features, swing_signal, add_indicators
 from core.position_tracker import BotState, Position
@@ -150,11 +149,13 @@ def main_loop():
     if detector.model is None:
         detector = train_phase(detector)
 
-    # Retrain weekly (every 7 * 24 * 60 / SIGNAL_INTERVAL minutes ≈ 168 cycles)
     cycles = 0
-    retrain_every = max(1, int(7 * 24 * 60 / SIGNAL_INTERVAL_MINUTES))
 
     while True:
+        cfg = rc.load()
+        signal_interval = cfg["signal_interval_minutes"]
+        retrain_every = max(1, int(7 * 24 * 60 / signal_interval))
+
         if RiskManager.check_lockout():
             logger.critical("Lockout file present. Sleeping 60s and re-checking.")
             time.sleep(60)
@@ -181,8 +182,8 @@ def main_loop():
         except Exception as e:
             logger.error(f"Unhandled error in main loop: {e}", exc_info=True)
 
-        logger.info(f"Sleeping {SIGNAL_INTERVAL_MINUTES} minutes until next cycle...")
-        time.sleep(SIGNAL_INTERVAL_MINUTES * 60)
+        logger.info(f"Sleeping {signal_interval} minutes until next cycle...")
+        time.sleep(signal_interval * 60)
 
 
 if __name__ == "__main__":

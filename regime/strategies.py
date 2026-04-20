@@ -1,21 +1,17 @@
 from typing import List, Dict
-from config.settings import (
-    REGIME_ALLOCATION, WATCHLIST, MAX_POSITION_SIZE_PCT, MAX_OPEN_POSITIONS
-)
-
-
-# Per-regime preferred sector/symbol subsets (swing trading focus)
-REGIME_WATCHLISTS: Dict[int, List[str]] = {
-    0: [],                                          # crash: no trades
-    1: ["SPY", "QQQ", "JPM", "BAC"],                # bear: only defensives/index
-    2: ["SPY", "QQQ", "AAPL", "MSFT", "JPM"],       # neutral: quality large-caps
-    3: WATCHLIST,                                    # bull: full universe
-    4: ["SPY", "QQQ", "MSFT", "AAPL", "GOOGL"],     # euphoria: trim to blue chips
-}
+from config.settings import MAX_POSITION_SIZE_PCT
+import config.runtime_config as rc
 
 
 def get_regime_watchlist(regime: int) -> List[str]:
-    return REGIME_WATCHLISTS.get(regime, WATCHLIST)
+    watchlist = rc.get_watchlist()
+    # In crash regime trade nothing; in bear/euphoria trim to blue chips + indices
+    overrides: Dict[int, List[str]] = {
+        0: [],
+        1: [s for s in ["SPY", "QQQ", "JPM", "BAC"] if s in watchlist or s in ["SPY", "QQQ", "JPM", "BAC"]],
+        4: [s for s in ["SPY", "QQQ", "MSFT", "AAPL", "GOOGL"] if s in watchlist or s in ["SPY", "QQQ", "MSFT", "AAPL", "GOOGL"]],
+    }
+    return overrides.get(regime, watchlist)
 
 
 def compute_position_size(
@@ -25,24 +21,19 @@ def compute_position_size(
     atr_pct: float,
     is_halved: bool = False,
 ) -> float:
-    """
-    Kelly-inspired position sizing capped by regime allocation and risk limits.
-    Returns dollar amount to allocate to the trade.
-    """
-    allocation_mult = REGIME_ALLOCATION.get(regime, 0.5)
+    cfg = rc.load()
+    allocation_mult = rc.get_regime_allocation().get(regime, 0.5)
+    max_pos_pct = cfg.get("max_position_size_pct", MAX_POSITION_SIZE_PCT)
+
     if is_halved:
         allocation_mult *= 0.5
 
-    # Base position: max allowed % of portfolio
-    base_dollars = portfolio_value * MAX_POSITION_SIZE_PCT * allocation_mult
-
-    # Scale by signal confidence (0.6–1.0 → 60–100%)
+    base_dollars = portfolio_value * max_pos_pct * allocation_mult
     confidence = min(abs(signal_score) / 1.0, 1.0)
     base_dollars *= max(confidence, 0.5)
 
-    # ATR-based volatility scaling: reduce size when vol is high
     if atr_pct > 0:
-        target_risk_pct = 0.01   # risk 1% of portfolio per trade
+        target_risk_pct = 0.01
         vol_adjusted = (target_risk_pct * portfolio_value) / atr_pct
         base_dollars = min(base_dollars, vol_adjusted)
 
@@ -52,4 +43,4 @@ def compute_position_size(
 def can_open_new_position(open_count: int, regime: int) -> bool:
     if regime == 0:
         return False
-    return open_count < MAX_OPEN_POSITIONS
+    return open_count < rc.load().get("max_open_positions", 8)

@@ -1,0 +1,25 @@
+{
+  "watchlist": [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA",
+    "META", "TSLA", "AMD", "JPM", "BAC",
+    "SPY", "QQQ", "IWM"
+  ],
+  "max_daily_spend_usd": 500.0,
+  "max_position_size_pct": 0.15,
+  "max_open_positions": 8,
+  "daily_loss_halt_pct": 0.02,
+  "peak_drawdown_lockout_pct": 0.10,
+  "stop_loss_pct": 0.05,
+  "take_profit_pct": 0.12,
+  "min_hold_days": 2,
+  "max_hold_days": 14,
+  "signal_interval_minutes": 60,
+  "extended_hours_enabled": false,
+  "regime_allocation": {
+    "0": 0.0,
+    "1": 0.3,
+    "2": 0.6,
+    "3": 1.0,
+    "4": 0.7
+  }
+}

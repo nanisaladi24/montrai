@@ -7,9 +7,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Tuple
 import config.settings as _cfg
-from config.settings import (
-    MAX_DAILY_SPEND_USD, DAILY_LOSS_HALT_PCT, STOP_LOSS_PCT, TAKE_PROFIT_PCT,
-)
+import config.runtime_config as rc
 from core.position_tracker import BotState, Position
 from monitoring.logger import get_logger
 
@@ -42,22 +40,24 @@ class RiskManager:
     @staticmethod
     def check_daily_spend(state: BotState, proposed_dollars: float) -> RiskVerdict:
         state.reset_daily_if_new_day()
-        remaining = MAX_DAILY_SPEND_USD - state.daily_spent
+        max_daily = rc.load().get("max_daily_spend_usd", _cfg.MAX_DAILY_SPEND_USD)
+        remaining = max_daily - state.daily_spent
         if remaining <= 0:
-            return RiskVerdict(False, f"Daily spend cap hit (${MAX_DAILY_SPEND_USD})", 0.0)
+            return RiskVerdict(False, f"Daily spend cap hit (${max_daily})", 0.0)
         allowed = min(proposed_dollars, remaining)
         if allowed < proposed_dollars:
-            logger.warning(f"Trade size trimmed to ${allowed:.2f} (daily cap ${MAX_DAILY_SPEND_USD})")
+            logger.warning(f"Trade size trimmed to ${allowed:.2f} (daily cap ${max_daily})")
         return RiskVerdict(True, "within daily cap", allowed)
 
     # ── Circuit Breaker 3: Daily loss trigger ─────────────────────────────────
     @staticmethod
     def check_daily_loss(portfolio_value: float, start_of_day_value: float, state: BotState) -> bool:
+        halt_pct = rc.load().get("daily_loss_halt_pct", _cfg.DAILY_LOSS_HALT_PCT)
         loss_pct = (start_of_day_value - portfolio_value) / max(start_of_day_value, 1)
-        if loss_pct >= DAILY_LOSS_HALT_PCT and not state.is_halved:
+        if loss_pct >= halt_pct and not state.is_halved:
             state.is_halved = True
             state.save()
-            logger.warning(f"Daily loss {loss_pct:.2%} >= {DAILY_LOSS_HALT_PCT:.2%}. Position sizes halved.")
+            logger.warning(f"Daily loss {loss_pct:.2%} >= {halt_pct:.2%}. Position sizes halved.")
             return True
         return False
 
@@ -67,7 +67,7 @@ class RiskManager:
         if portfolio_value > state.peak_equity:
             state.peak_equity = portfolio_value
             state.save()
-        peak_dd_pct = _cfg.PEAK_DRAWDOWN_LOCKOUT_PCT
+        peak_dd_pct = rc.load().get("peak_drawdown_lockout_pct", _cfg.PEAK_DRAWDOWN_LOCKOUT_PCT)
         drawdown = (state.peak_equity - portfolio_value) / max(state.peak_equity, 1)
         if drawdown >= peak_dd_pct:
             logger.critical(
@@ -117,6 +117,9 @@ class RiskManager:
 
     @staticmethod
     def compute_stops(entry_price: float) -> Tuple[float, float]:
-        stop_loss = round(entry_price * (1 - STOP_LOSS_PCT), 4)
-        take_profit = round(entry_price * (1 + TAKE_PROFIT_PCT), 4)
+        cfg = rc.load()
+        sl_pct = cfg.get("stop_loss_pct", _cfg.STOP_LOSS_PCT)
+        tp_pct = cfg.get("take_profit_pct", _cfg.TAKE_PROFIT_PCT)
+        stop_loss = round(entry_price * (1 - sl_pct), 4)
+        take_profit = round(entry_price * (1 + tp_pct), 4)
         return stop_loss, take_profit
