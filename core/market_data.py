@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import pytz
 from datetime import datetime, timedelta
@@ -211,3 +212,88 @@ def fetch_macro_features(days: int = 504) -> pd.DataFrame:
             result[col] = 0.0
 
     return result[keep].tail(days)
+
+
+def _bs_gamma(S: float, K: float, T: float, sigma: float, r: float = 0.04) -> float:
+    """Black-Scholes gamma for a single option."""
+    if T <= 0 or sigma <= 0:
+        return 0.0
+    from math import log, sqrt, exp, pi
+    d1 = (log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * sqrt(T))
+    return exp(-0.5 * d1 ** 2) / (sqrt(2 * pi) * S * sigma * sqrt(T))
+
+
+def fetch_gex(symbol: str = "SPY", max_expiries: int = 4) -> dict:
+    """
+    Calculate net Gamma Exposure (GEX) from the options chain.
+    Returns:
+      gex_total    — net GEX in $billions (positive = dealers long gamma)
+      gex_per_spot — GEX normalised by spot price (scale-invariant)
+      gamma_flip   — strike closest to zero net gamma (price tends to gravitate here)
+    """
+    try:
+        ticker = yf.Ticker(symbol)
+        spot = ticker.fast_info.last_price
+        if not spot:
+            return {}
+
+        expiries = ticker.options[:max_expiries]
+        today = datetime.today().date()
+
+        total_call_gex = 0.0
+        total_put_gex = 0.0
+        strike_gex: dict[float, float] = {}
+
+        for exp_str in expiries:
+            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+            T = max((exp_date - today).days / 365.0, 1 / 365)
+
+            chain = ticker.option_chain(exp_str)
+
+            for _, row in chain.calls.iterrows():
+                iv = row.get("impliedVolatility", 0)
+                oi = row.get("openInterest", 0) or 0
+                K = row["strike"]
+                if iv <= 0 or oi <= 0:
+                    continue
+                g = _bs_gamma(spot, K, T, iv)
+                # Dealers short calls → negative delta → long gamma on calls
+                gex = g * oi * 100 * spot ** 2 / 1e9
+                total_call_gex += gex
+                strike_gex[K] = strike_gex.get(K, 0) + gex
+
+            for _, row in chain.puts.iterrows():
+                iv = row.get("impliedVolatility", 0)
+                oi = row.get("openInterest", 0) or 0
+                K = row["strike"]
+                if iv <= 0 or oi <= 0:
+                    continue
+                g = _bs_gamma(spot, K, T, iv)
+                # Dealers long puts → negative gamma on puts
+                gex = g * oi * 100 * spot ** 2 / 1e9
+                total_put_gex += gex
+                strike_gex[K] = strike_gex.get(K, 0) - gex
+
+        net_gex = total_call_gex - total_put_gex
+
+        # Gamma flip: strike where cumulative GEX crosses zero
+        sorted_strikes = sorted(strike_gex.keys())
+        cumulative = 0.0
+        gamma_flip = spot
+        for k in sorted_strikes:
+            prev = cumulative
+            cumulative += strike_gex[k]
+            if prev * cumulative < 0:  # sign change
+                gamma_flip = k
+                break
+
+        return {
+            "gex_total": round(net_gex, 4),
+            "gex_per_spot": round(net_gex / spot, 6),
+            "gamma_flip": round(gamma_flip, 2),
+            "gamma_flip_distance_pct": round((gamma_flip - spot) / spot, 4),
+            "spot": spot,
+        }
+    except Exception as e:
+        logger.warning(f"fetch_gex({symbol}): {e}")
+        return {}

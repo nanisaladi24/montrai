@@ -50,13 +50,13 @@ All sourced via **yfinance** — no API key needed.
 ### SpotGamma
 - **Cost:** ~$50/mo (Founder tier) | ~$110/mo (Pro)
 - **Sign up:** https://spotgamma.com/
-- **What it unlocks:**
-  - GEX (Gamma Exposure) — whether dealers are long or short gamma
-  - Positive gamma → price mean-reverts to strikes (chop market)
-  - Negative gamma → price moves are amplified (trending/volatile)
-  - Key gamma levels: price tends to gravitate toward or bounce off these
-- **Set in dashboard:** Data Sources → SpotGamma API Key
-- **Impact:** High. This is where real quant edge lives for index/ETF trading. Most retail bots don't use this.
+- **API:** None — SpotGamma is a web UI only, no public API.
+- **Status:** GEX is **already calculated internally** in Montrai using the SPY options chain + Black-Scholes. `gex_per_spot` and `gamma_flip_dist` are always-active HMM features, no subscription needed.
+  - Positive GEX → dealers long gamma → price mean-reverts (chop)
+  - Negative GEX → dealers short gamma → moves get amplified (trending)
+  - `gamma_flip_dist` — how far spot is from the zero-gamma level
+- **Use SpotGamma for:** Visual cross-checking your bot's GEX readings. Their charts are excellent for manual review.
+- **Impact:** Already captured — no action needed.
 
 ### Unusual Whales
 - **Cost:** ~$50/mo
@@ -93,8 +93,8 @@ All sourced via **yfinance** — no API key needed.
 
 ## Priority Order (Suggested Upgrade Path)
 
-1. **FRED** — Free, do it today. Yield curve alone is worth it.
-2. **SpotGamma** — $50/mo. Highest signal-to-cost ratio for index/ETF swing trading.
+1. **FRED** — Free, done. Yield curve, fed funds rate, credit spread active.
+2. **SpotGamma** — No API needed. GEX already calculated internally from yfinance options chain.
 3. **Unusual Whales** — $50/mo. Add once the bot is consistently profitable in paper.
 4. **Polygon.io** — $29–79/mo. Prioritize when adding intraday or options strategies.
 5. **Nasdaq Data Link** — Add when short interest or COT signals are needed.

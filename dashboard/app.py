@@ -246,12 +246,12 @@ with tab_data:
         },
         {
             "key": "spotgamma_api_key",
-            "name": "SpotGamma",
+            "name": "SpotGamma (reference only)",
             "cost": "~$50/mo (Founder) | ~$110/mo (Pro)",
             "signup": "https://spotgamma.com/",
-            "unlocks": "`gex_level`, `gamma_flip_distance` — dealer gamma positioning",
-            "why": "Positive gamma → price mean-reverts. Negative gamma → amplified moves. Best quant edge for index/ETF trading.",
-            "priority": "🟠 High value, ~$50/mo",
+            "unlocks": "No API available — GEX is already calculated internally from the SPY options chain using Black-Scholes. `gex_per_spot` and `gamma_flip_dist` are always active.",
+            "why": "SpotGamma is a great visual reference to cross-check your bot's GEX readings. Not needed for data.",
+            "priority": "🔵 Visual reference only",
         },
         {
             "key": "unusual_whales_api_key",
@@ -313,8 +313,9 @@ with tab_data:
         "ret_1d/5d/20d/60d", "realised_vol", "atr_pct", "bb_position", "vol_ratio",
         "vix_rank", "vix_term_ratio", "vvix_rank", "vvix_vix_ratio",
         "tlt_ret", "dxy_ret", "hyg_ret", "smh_spy_rs",
+        "gex_per_spot", "gamma_flip_dist",
     ]
-    st.markdown("**Always on (yfinance):** " + ", ".join(f"`{f}`" for f in base_features))
+    st.markdown("**Always on (yfinance + BS calc):** " + ", ".join(f"`{f}`" for f in base_features))
     if active_ds.get("fred_api_key"):
         st.markdown("**FRED (active):** `yield_curve_spread`, `fed_funds_rate`, `hy_credit_spread`")
     if active_ds.get("spotgamma_api_key"):

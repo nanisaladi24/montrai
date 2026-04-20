@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 from monitoring.logger import get_logger
-from core.market_data import fetch_macro_features, fetch_fred_features
+from core.market_data import fetch_macro_features, fetch_fred_features, fetch_gex
 import config.runtime_config as _rc
 
 logger = get_logger("feature_eng")
@@ -102,6 +102,15 @@ def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
             logger.info(f"FRED features active: {[c for c in all_cols if c in fred.columns]}")
         except Exception as e:
             logger.warning(f"FRED feature fetch failed, skipping: {e}")
+
+    # GEX: calculated from SPY options chain via Black-Scholes (no paid API needed)
+    gex = fetch_gex("SPY")
+    if gex:
+        merged["gex_per_spot"] = gex.get("gex_per_spot", 0.0)
+        merged["gamma_flip_dist"] = gex.get("gamma_flip_distance_pct", 0.0)
+        all_cols += ["gex_per_spot", "gamma_flip_dist"]
+        logger.info(f"GEX: {gex['gex_total']:+.2f}B | flip @ ${gex['gamma_flip']} "
+                    f"({gex['gamma_flip_distance_pct']:+.1%} from spot)")
 
     features = merged[all_cols].replace([np.inf, -np.inf], np.nan).ffill().dropna()
     return features.values
