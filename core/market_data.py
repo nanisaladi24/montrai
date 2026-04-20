@@ -106,10 +106,14 @@ def fetch_macro_features(days: int = 504) -> pd.DataFrame:
     Falls back gracefully — missing series are filled with 0.
     """
     symbols = {
-        "vix":  "^VIX",
+        "vix":   "^VIX",
         "vix3m": "^VIX3M",
-        "tlt":  "TLT",
-        "dxy":  "DX-Y.NYB",
+        "vvix":  "^VVIX",   # vol-of-vol: early warning before VIX spikes
+        "tlt":   "TLT",
+        "dxy":   "DX-Y.NYB",
+        "hyg":   "HYG",     # high-yield credit: risk-on/off confirmation
+        "smh":   "SMH",     # semiconductor ETF: sector leadership proxy
+        "spy":   "SPY",     # needed for SMH/SPY relative strength
     }
     end = datetime.today()
     start = end - timedelta(days=days + 60)
@@ -131,6 +135,12 @@ def fetch_macro_features(days: int = 504) -> pd.DataFrame:
     else:
         result["vix_term_ratio"] = float("nan")
 
+    # VVIX/VIX ratio: rising VVIX before VIX moves = early vol expansion warning
+    if "vvix" in result.columns and "vix" in result.columns:
+        result["vvix_vix_ratio"] = result["vvix"] / result["vix"].replace(0, float("nan"))
+    else:
+        result["vvix_vix_ratio"] = float("nan")
+
     if "tlt" in result.columns:
         result["tlt_ret"] = result["tlt"].pct_change()
     else:
@@ -141,7 +151,19 @@ def fetch_macro_features(days: int = 504) -> pd.DataFrame:
     else:
         result["dxy_ret"] = 0.0
 
-    keep = ["vix", "vix3m", "vix_term_ratio", "tlt_ret", "dxy_ret"]
+    if "hyg" in result.columns:
+        result["hyg_ret"] = result["hyg"].pct_change()
+    else:
+        result["hyg_ret"] = 0.0
+
+    # SMH relative strength vs SPY: positive = semis leading = risk-on tech regime
+    if "smh" in result.columns and "spy" in result.columns:
+        result["smh_spy_rs"] = result["smh"].pct_change() - result["spy"].pct_change()
+    else:
+        result["smh_spy_rs"] = 0.0
+
+    keep = ["vix", "vix3m", "vix_term_ratio", "vvix", "vvix_vix_ratio",
+            "tlt_ret", "dxy_ret", "hyg_ret", "smh_spy_rs"]
     for col in keep:
         if col not in result.columns:
             result[col] = 0.0

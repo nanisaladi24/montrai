@@ -73,13 +73,20 @@ def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
 
     merged = df[base_cols].join(macro, how="left")
 
-    # Normalise VIX to a 0–1 scale using rolling percentile rank
-    if "vix" in merged.columns:
-        merged["vix_rank"] = merged["vix"].rank(pct=True)
-    else:
-        merged["vix_rank"] = 0.5
+    # Percentile-rank VIX and VVIX so scale is invariant across history
+    for raw_col, rank_col in [("vix", "vix_rank"), ("vvix", "vvix_rank")]:
+        if raw_col in merged.columns:
+            merged[rank_col] = merged[raw_col].rank(pct=True)
+        else:
+            merged[rank_col] = 0.5
 
-    all_cols = base_cols + ["vix_rank", "vix_term_ratio", "tlt_ret", "dxy_ret"]
+    all_cols = base_cols + [
+        "vix_rank", "vix_term_ratio",
+        "vvix_rank", "vvix_vix_ratio",   # early vol-expansion warning
+        "tlt_ret", "dxy_ret",
+        "hyg_ret",                        # credit risk / risk appetite
+        "smh_spy_rs",                     # semiconductor sector leadership
+    ]
     features = merged[all_cols].replace([np.inf, -np.inf], np.nan).ffill().dropna()
     return features.values
 
