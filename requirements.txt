@@ -1,0 +1,18 @@
+# Brokers
+alpaca-py>=0.28.0
+robin_stocks>=2.1.0        # only needed when BROKER=robinhood
+
+# Data & ML
+yfinance>=0.2.38
+hmmlearn>=0.3.2
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+
+# Infrastructure
+streamlit>=1.35
+python-dotenv>=1.0
+pytz>=2024.1
+
+# Testing
+pytest>=8.0
