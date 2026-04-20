@@ -1,7 +1,8 @@
 import numpy as np
 import pandas as pd
 from monitoring.logger import get_logger
-from core.market_data import fetch_macro_features
+from core.market_data import fetch_macro_features, fetch_fred_features
+import config.runtime_config as _rc
 
 logger = get_logger("feature_eng")
 
@@ -82,11 +83,26 @@ def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
 
     all_cols = base_cols + [
         "vix_rank", "vix_term_ratio",
-        "vvix_rank", "vvix_vix_ratio",   # early vol-expansion warning
+        "vvix_rank", "vvix_vix_ratio",
         "tlt_ret", "dxy_ret",
-        "hyg_ret",                        # credit risk / risk appetite
-        "smh_spy_rs",                     # semiconductor sector leadership
+        "hyg_ret",
+        "smh_spy_rs",
     ]
+
+    # FRED: yield curve + fed funds + credit spread (activates when API key set)
+    fred_key = _rc.load().get("data_sources", {}).get("fred_api_key", "")
+    if fred_key:
+        try:
+            fred = fetch_fred_features(fred_key, days=len(df) + 120)
+            fred.index = pd.to_datetime(fred.index)
+            merged = merged.join(fred, how="left")
+            for col in ["yield_curve_spread", "fed_funds_rate", "hy_credit_spread"]:
+                if col in merged.columns:
+                    all_cols.append(col)
+            logger.info(f"FRED features active: {[c for c in all_cols if c in fred.columns]}")
+        except Exception as e:
+            logger.warning(f"FRED feature fetch failed, skipping: {e}")
+
     features = merged[all_cols].replace([np.inf, -np.inf], np.nan).ffill().dropna()
     return features.values
 

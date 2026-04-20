@@ -98,6 +98,48 @@ def latest_quote(symbol: str) -> Optional[float]:
         return None
 
 
+def fetch_fred_features(api_key: str, days: int = 504) -> pd.DataFrame:
+    """
+    Fetch macro features from FRED (Federal Reserve Economic Data).
+    Free API key: https://fred.stlouisfed.org/docs/api/api_key.html
+    Returns: yield_curve_spread (10Y-2Y), fed_funds_rate, hy_credit_spread
+    """
+    series = {
+        "T10Y2Y":  "yield_curve_spread",  # 10Y–2Y treasury spread (recession signal)
+        "FEDFUNDS": "fed_funds_rate",      # Effective federal funds rate
+        "BAMLH0A0HYM2": "hy_credit_spread", # High-yield OAS credit spread
+    }
+    end = datetime.today()
+    start = end - timedelta(days=days + 60)
+    raw = {}
+    for fred_id, col_name in series.items():
+        url = (
+            f"https://api.stlouisfed.org/fred/series/observations"
+            f"?series_id={fred_id}&api_key={api_key}&file_type=json"
+            f"&observation_start={start.strftime('%Y-%m-%d')}"
+            f"&observation_end={end.strftime('%Y-%m-%d')}"
+        )
+        try:
+            import urllib.request, json as _json
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = _json.loads(resp.read())
+            obs = data.get("observations", [])
+            s = pd.Series(
+                {o["date"]: float(o["value"]) for o in obs if o["value"] != "."},
+                dtype=float,
+            )
+            s.index = pd.to_datetime(s.index)
+            raw[col_name] = s
+        except Exception as e:
+            logger.warning(f"fetch_fred_features: could not fetch {fred_id}: {e}")
+
+    if not raw:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw).ffill().tail(days)
+    return df
+
+
 def fetch_macro_features(days: int = 504) -> pd.DataFrame:
     """
     Fetch macro/cross-asset features aligned to SPY trading days.
