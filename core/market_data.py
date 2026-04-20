@@ -96,3 +96,54 @@ def latest_quote(symbol: str) -> Optional[float]:
     except Exception as e:
         logger.warning(f"latest_quote({symbol}): {e}")
         return None
+
+
+def fetch_macro_features(days: int = 504) -> pd.DataFrame:
+    """
+    Fetch macro/cross-asset features aligned to SPY trading days.
+    Returns a DataFrame indexed by date with columns:
+      vix, vix3m, vix_term_ratio, tlt_ret, dxy_ret
+    Falls back gracefully — missing series are filled with 0.
+    """
+    symbols = {
+        "vix":  "^VIX",
+        "vix3m": "^VIX3M",
+        "tlt":  "TLT",
+        "dxy":  "DX-Y.NYB",
+    }
+    end = datetime.today()
+    start = end - timedelta(days=days + 60)
+    raw = {}
+    for key, ticker in symbols.items():
+        try:
+            df = yf.download(ticker, start=start, end=end, interval="1d",
+                             auto_adjust=True, progress=False)
+            if not df.empty:
+                close_col = "Close" if "Close" in df.columns else df.columns[0]
+                raw[key] = df[close_col].squeeze()
+        except Exception as e:
+            logger.warning(f"fetch_macro_features: could not fetch {ticker}: {e}")
+
+    result = pd.DataFrame(raw)
+
+    if "vix" in result.columns and "vix3m" in result.columns:
+        result["vix_term_ratio"] = result["vix"] / result["vix3m"].replace(0, float("nan"))
+    else:
+        result["vix_term_ratio"] = float("nan")
+
+    if "tlt" in result.columns:
+        result["tlt_ret"] = result["tlt"].pct_change()
+    else:
+        result["tlt_ret"] = 0.0
+
+    if "dxy" in result.columns:
+        result["dxy_ret"] = result["dxy"].pct_change()
+    else:
+        result["dxy_ret"] = 0.0
+
+    keep = ["vix", "vix3m", "vix_term_ratio", "tlt_ret", "dxy_ret"]
+    for col in keep:
+        if col not in result.columns:
+            result[col] = 0.0
+
+    return result[keep].tail(days)

@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from monitoring.logger import get_logger
+from core.market_data import fetch_macro_features
 
 logger = get_logger("feature_eng")
 
@@ -9,9 +10,11 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Add RSI, MACD, Bollinger Bands, ATR, and volume ratio to OHLCV df."""
     df = df.copy()
 
-    # Returns
-    df["ret_1d"] = df["close"].pct_change()
-    df["ret_5d"] = df["close"].pct_change(5)
+    # Returns (multi-timeframe)
+    df["ret_1d"]  = df["close"].pct_change()
+    df["ret_5d"]  = df["close"].pct_change(5)
+    df["ret_20d"] = df["close"].pct_change(20)
+    df["ret_60d"] = df["close"].pct_change(60)
 
     # RSI (14)
     delta = df["close"].diff()
@@ -53,12 +56,31 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_hmm_features(df: pd.DataFrame) -> np.ndarray:
-    """Return feature matrix suitable for HMM training."""
-    cols = ["ret_1d", "realised_vol", "atr_pct", "bb_position", "vol_ratio"]
-    missing = [c for c in cols if c not in df.columns]
-    if missing:
+    """Return feature matrix suitable for HMM training, including macro features."""
+    base_cols = ["ret_1d", "ret_5d", "ret_20d", "ret_60d",
+                 "realised_vol", "atr_pct", "bb_position", "vol_ratio"]
+    if any(c not in df.columns for c in base_cols):
         df = add_indicators(df)
-    features = df[cols].replace([np.inf, -np.inf], np.nan).dropna()
+
+    # Align macro features to the same date index
+    macro = fetch_macro_features(days=len(df) + 120)
+    macro.index = pd.to_datetime(macro.index)
+    if isinstance(macro.index, pd.MultiIndex):
+        macro.index = macro.index.get_level_values(0)
+    df.index = pd.to_datetime(df.index)
+    if isinstance(df.index, pd.MultiIndex):
+        df.index = df.index.get_level_values(0)
+
+    merged = df[base_cols].join(macro, how="left")
+
+    # Normalise VIX to a 0–1 scale using rolling percentile rank
+    if "vix" in merged.columns:
+        merged["vix_rank"] = merged["vix"].rank(pct=True)
+    else:
+        merged["vix_rank"] = 0.5
+
+    all_cols = base_cols + ["vix_rank", "vix_term_ratio", "tlt_ret", "dxy_ret"]
+    features = merged[all_cols].replace([np.inf, -np.inf], np.nan).ffill().dropna()
     return features.values
 
 
