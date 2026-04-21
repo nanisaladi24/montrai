@@ -245,15 +245,6 @@ with tab_data:
             "priority": "🟡 When adding intraday/options",
         },
         {
-            "key": "spotgamma_api_key",
-            "name": "SpotGamma (reference only)",
-            "cost": "~$50/mo (Founder) | ~$110/mo (Pro)",
-            "signup": "https://spotgamma.com/",
-            "unlocks": "No API available — GEX is already calculated internally from the SPY options chain using Black-Scholes. `gex_per_spot` and `gamma_flip_dist` are always active.",
-            "why": "SpotGamma is a great visual reference to cross-check your bot's GEX readings. Not needed for data.",
-            "priority": "🔵 Visual reference only",
-        },
-        {
             "key": "unusual_whales_api_key",
             "name": "Unusual Whales",
             "cost": "~$50/mo",
@@ -318,8 +309,6 @@ with tab_data:
     st.markdown("**Always on (yfinance + BS calc):** " + ", ".join(f"`{f}`" for f in base_features))
     if active_ds.get("fred_api_key"):
         st.markdown("**FRED (active):** `yield_curve_spread`, `fed_funds_rate`, `hy_credit_spread`")
-    if active_ds.get("spotgamma_api_key"):
-        st.markdown("**SpotGamma (active):** `gex_level`, `gamma_flip_distance`")
     if active_ds.get("unusual_whales_api_key"):
         st.markdown("**Unusual Whales (active):** `options_flow_score`")
 
