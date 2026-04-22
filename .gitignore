@@ -5,9 +5,14 @@ __pycache__/
 *.pyc
 *.pkl
 bot_state.json
+bot_state.json.bak-*
+bot_heartbeat.json
 LOCKOUT
 logs/
+data/
+.claude/
 .pytest_cache/
 *.egg-info/
 dist/
 build/
+.DS_Store

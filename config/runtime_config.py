@@ -23,6 +23,20 @@ from config.settings import (
     SIGNAL_INTERVAL_MINUTES,
     EXTENDED_HOURS_ENABLED,
     REGIME_ALLOCATION,
+    STOCK_TRADING_ENABLED,
+    OPTIONS_TRADING_ENABLED,
+    INTRADAY_ENABLED,
+    STOCK_MAX_DAILY_USD,
+    OPTIONS_MAX_DAILY_USD,
+    OPTIONS_TAKE_PROFIT_PCT,
+    OPTIONS_STOP_LOSS_PCT,
+    OPTIONS_MIN_DTE_EXIT,
+    OPTIONS_TARGET_DTE,
+    OPTIONS_TARGET_DELTA,
+    COVERED_CALL_ENABLED,
+    COVERED_CALL_TARGET_DELTA,
+    COVERED_CALL_TARGET_DTE,
+    COVERED_CALL_AUTO_ACQUIRE,
 )
 
 _RUNTIME_FILE = Path(__file__).parent / "runtime.json"
@@ -41,6 +55,27 @@ _DEFAULTS: dict[str, Any] = {
     "signal_interval_minutes": SIGNAL_INTERVAL_MINUTES,
     "extended_hours_enabled": EXTENDED_HOURS_ENABLED,
     "regime_allocation": {str(k): v for k, v in REGIME_ALLOCATION.items()},
+    # Financial Datasets overlay — set to false to disable fundamental scoring
+    "financial_datasets_enabled": True,
+    # Trade-mode knobs (hot-reloadable)
+    "stock_trading_enabled":   STOCK_TRADING_ENABLED,
+    "options_trading_enabled": OPTIONS_TRADING_ENABLED,
+    "intraday_enabled":        INTRADAY_ENABLED,
+    "stock_max_daily_usd":     STOCK_MAX_DAILY_USD,
+    "options_max_daily_usd":   OPTIONS_MAX_DAILY_USD,
+    # Options behavior
+    "options_take_profit_pct": OPTIONS_TAKE_PROFIT_PCT,
+    "options_stop_loss_pct":   OPTIONS_STOP_LOSS_PCT,
+    "options_min_dte_exit":    OPTIONS_MIN_DTE_EXIT,
+    "options_target_dte_min":  OPTIONS_TARGET_DTE[0],
+    "options_target_dte_max":  OPTIONS_TARGET_DTE[1],
+    "options_target_delta":    OPTIONS_TARGET_DELTA,
+    # Covered call
+    "covered_call_enabled":           COVERED_CALL_ENABLED,
+    "covered_call_target_delta":      COVERED_CALL_TARGET_DELTA,
+    "covered_call_target_dte_min":    COVERED_CALL_TARGET_DTE[0],
+    "covered_call_target_dte_max":    COVERED_CALL_TARGET_DTE[1],
+    "covered_call_auto_acquire":      COVERED_CALL_AUTO_ACQUIRE,
 }
 
 

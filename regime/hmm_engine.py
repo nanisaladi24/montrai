@@ -96,6 +96,23 @@ class RegimeDetector:
         """Predict current regime with stability filter."""
         if self.model is None:
             return 2  # neutral default
+        # Empty feature matrix (data fetch failure or cold start) — hold
+        # the last stable reading rather than crashing the main loop.
+        if features is None or features.size == 0 or features.shape[0] == 0:
+            logger.warning("Empty feature matrix passed to predict_regime; returning neutral.")
+            if self._regime_history:
+                return self._regime_history[-1]
+            return 2
+        # Guard against feature-count mismatch after a data-source change
+        expected = self.model.means_.shape[1]
+        if features.shape[1] != expected:
+            logger.warning(
+                f"Feature count mismatch: model expects {expected}, got {features.shape[1]}. "
+                "Retraining HMM."
+            )
+            self.train("SPY")
+            if self.model is None or features.shape[1] != self.model.means_.shape[1]:
+                return 2
         raw_state = int(self.model.predict(features)[-1])
         mapped = self._state_to_regime.get(raw_state, raw_state)
 

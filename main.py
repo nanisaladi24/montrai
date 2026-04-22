@@ -3,26 +3,58 @@ Main Orchestrator — Train → Monitor → Execute loop.
 
 Run modes:
   python main.py               # live trading loop
-  python main.py --backtest    # run walk-forward backtest only
+  python main.py --backtest    # run walk-forward backtest for one symbol
+  python main.py --backtest-all # walk-forward backtest for all watchlist symbols
+  python main.py --scan        # score all watchlist symbols now — ranked buy candidates
   python main.py --train       # retrain HMM only
 """
 import argparse
+import json
+import os
 import time
 import sys
-from datetime import datetime
+import pandas as pd
+from datetime import datetime, timezone
+from pathlib import Path
 
 from config.settings import TRADING_MODE
 import config.runtime_config as rc
-from core.market_data import fetch_historical, latest_quote, is_market_open
+from core.market_data import fetch_historical, latest_quote, is_market_open, current_session
 from core.feature_engineering import build_hmm_features, swing_signal, add_indicators
-from core.position_tracker import BotState, Position
+from core.position_tracker import BotState, Position, OptionsPosition
 from regime.hmm_engine import RegimeDetector
 from regime.strategies import get_regime_watchlist, compute_position_size, can_open_new_position
 from risk.risk_manager import RiskManager
-from executor.order_executor import login, get_portfolio_value, get_cash, buy_fractional, sell_all
+from executor.order_executor import (
+    login, get_portfolio_value, get_cash,
+    buy_fractional, sell_all,
+    supports_options, buy_option, sell_option, get_option_positions, get_stock_positions,
+)
 from monitoring.logger import get_logger
 
 logger = get_logger("main")
+
+HEARTBEAT_FILE = "bot_heartbeat.json"
+
+
+def write_heartbeat(state: BotState, regime: int, regime_name: str, mode: str):
+    """Dashboard reads this to show Running/Sleeping/Stopped. Written each cycle."""
+    try:
+        with open(HEARTBEAT_FILE, "w") as f:
+            json.dump({
+                "ts": datetime.now(timezone.utc).isoformat() + "Z",
+                "pid": os.getpid(),
+                "regime": regime,
+                "regime_name": regime_name,
+                "session": current_session(),
+                "cycles": state.cycles,
+                "mode": mode,
+                "stock_trading_enabled":   rc.load().get("stock_trading_enabled", False),
+                "options_trading_enabled": rc.load().get("options_trading_enabled", True),
+                "intraday_enabled":        rc.load().get("intraday_enabled", False),
+            }, f, indent=2)
+    except Exception as e:
+        logger.warning(f"write_heartbeat: {e}")
 
 
 def train_phase(detector: RegimeDetector) -> RegimeDetector:
@@ -41,7 +73,13 @@ def monitor_phase(detector: RegimeDetector, state: BotState, portfolio_value: fl
         logger.warning("Could not fetch SPY data for regime detection.")
         return 2  # neutral fallback
     df = add_indicators(df)
+    if df.empty:
+        logger.warning("SPY indicators dropped to empty frame — skipping regime detect.")
+        return 2
     features = build_hmm_features(df)
+    if features is None or getattr(features, "size", 0) == 0:
+        logger.warning("HMM feature matrix empty — skipping regime detect.")
+        return 2
     regime = detector.predict_regime(features)
     regime_name = detector.regime_name(regime)
     logger.info(f"Current regime: {regime} ({regime_name.upper()})")
@@ -87,11 +125,11 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
         if symbol in state.positions:
             continue  # already holding
 
-        df = fetch_historical(symbol, days=60)
-        if df.empty or len(df) < 30:
+        df = fetch_historical(symbol, days=120)
+        if df.empty or len(df) < 65:
             continue
 
-        signal = swing_signal(df)
+        signal = swing_signal(df, symbol=symbol)
         if signal["score"] < 0.6:
             continue
 
@@ -121,7 +159,7 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
                 symbol=symbol,
                 quantity=round(qty, 6),
                 entry_price=price,
-                entry_date=datetime.utcnow().date().isoformat(),
+                entry_date=datetime.now(timezone.utc).date().isoformat(),
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 regime_at_entry=regime_name,
@@ -136,8 +174,274 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
             break   # max positions reached
 
 
+def options_execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfolio_value: float):
+    """Options-native execution path — exits first, then new directional entries."""
+    from executor.options_strategies import select_trade
+    from core.options_data import get_option_chain
+
+    logger.info("═══ OPTIONS EXECUTION PHASE ═══")
+    state.reset_daily_if_new_day()
+    regime_name = detector.regime_name(regime)
+
+    if not supports_options():
+        logger.warning("Current broker does not support options — skipping options phase.")
+        return
+
+    # ── 1. Exits on existing option positions ──────────────────────────────────
+    broker_positions = {p["symbol"]: p for p in get_option_positions()}
+    for contract_symbol, pos in list(state.options_positions.items()):
+        if pos.is_short:
+            continue  # short legs (covered calls, spreads) are owned by covered_call_phase
+        broker_pos = broker_positions.get(contract_symbol)
+        current_premium = (broker_pos or {}).get("current_price", 0.0) or 0.0
+        if current_premium <= 0:
+            # Fallback: pull a fresh snapshot for this single contract
+            try:
+                from core.options_data import _clients
+                data_client, _ = _clients()
+                from alpaca.data.requests import OptionSnapshotRequest
+                req = OptionSnapshotRequest(symbol_or_symbols=[contract_symbol])
+                snaps = data_client.get_option_snapshot(req)
+                snap = snaps.get(contract_symbol)
+                quote = getattr(snap, "latest_quote", None) if snap else None
+                if quote:
+                    bid = float(getattr(quote, "bid_price", 0) or 0)
+                    ask = float(getattr(quote, "ask_price", 0) or 0)
+                    if bid > 0 and ask > 0:
+                        current_premium = (bid + ask) / 2
+            except Exception as e:
+                logger.warning(f"Could not snapshot {contract_symbol} for exit check: {e}")
+                continue
+
+        should_exit, reason = RiskManager.should_exit_option(pos.entry_premium, current_premium, pos.dte())
+        if not should_exit:
+            continue
+        qty = pos.qty
+        # Sell slightly below mid to cross the spread — DAY limit order
+        limit = round(max(current_premium * 0.98, 0.05), 2)
+        order_id = sell_option(contract_symbol, qty, limit, reason, regime_name)
+        if order_id:
+            pnl = state.close_option_position(contract_symbol, current_premium)
+            logger.info(f"CLOSED {contract_symbol} x{qty} @ ${current_premium:.2f} | "
+                        f"P&L ${pnl:+.2f} | reason: {reason}")
+
+    # ── 2. Daily-loss / drawdown-halving still applies (shared counter) ────────
+    start_val = state.peak_equity or portfolio_value
+    RiskManager.check_daily_loss(portfolio_value, start_val, state)
+
+    # ── 3. Entry scan — directional calls/puts only in Phase 1 ─────────────────
+    cfg = rc.load()
+    max_daily = cfg.get("options_max_daily_usd", 1000.0)
+    remaining = max_daily - state.options_daily_spent
+    if remaining <= 10:
+        logger.info(f"Options daily cap ${max_daily} consumed (${state.options_daily_spent:.2f}).")
+        return
+
+    watchlist = get_regime_watchlist(regime)
+    # Per-trade budget: spread remaining budget across up to 4 fresh entries
+    slots_left = max(1, 4 - len(state.options_positions))
+    per_trade_budget = min(remaining, remaining / slots_left)
+
+    # Score every candidate first so we allocate budget to the strongest signals
+    picks = []
+    for symbol in watchlist:
+        if any(op.underlying == symbol for op in state.options_positions.values()):
+            continue  # already have exposure on this underlying
+        df = fetch_historical(symbol, days=120)
+        if df.empty or len(df) < 65:
+            continue
+        sig = swing_signal(df, symbol=symbol)
+        score = sig.get("score", 0.0)
+        if abs(score) < 0.6:
+            continue
+        pick = select_trade(symbol, score, regime_name, per_trade_budget)
+        if pick is None:
+            continue
+        picks.append(pick)
+
+    picks.sort(key=lambda p: abs(p.score), reverse=True)
+
+    for pick in picks:
+        if state.options_daily_spent + pick.total_cost > max_daily:
+            logger.info(f"Skipping {pick.underlying} {pick.strategy}: would exceed daily cap.")
+            continue
+        verdict = RiskManager.approve_options_trade(pick.contract.symbol, pick.total_cost, state)
+        if not verdict.allowed:
+            logger.warning(f"Options trade blocked: {pick.contract.symbol} — {verdict.reason}")
+            continue
+        # If risk trimmed the budget, recompute qty against the same per-contract cost
+        per_contract = pick.limit_price * 100
+        affordable_qty = int(verdict.adjusted_dollars // per_contract)
+        if affordable_qty < 1:
+            continue
+
+        order_id = buy_option(pick.contract.symbol, affordable_qty, pick.limit_price, regime_name)
+        if not order_id:
+            continue
+        cost = affordable_qty * per_contract
+        state.options_daily_spent += cost
+        state.options_positions[pick.contract.symbol] = OptionsPosition(
+            contract_symbol=pick.contract.symbol,
+            underlying=pick.underlying,
+            side=pick.contract.side,
+            strike=pick.contract.strike,
+            expiry=pick.contract.expiry.isoformat() if hasattr(pick.contract.expiry, "isoformat") else str(pick.contract.expiry),
+            qty=affordable_qty,
+            entry_premium=pick.limit_price,
+            entry_date=datetime.now(timezone.utc).date().isoformat(),
+            regime_at_entry=regime_name,
+            strategy=pick.strategy,
+        )
+        state.save()
+        logger.info(f"OPENED {pick.strategy} {pick.contract.symbol} x{affordable_qty} "
+                    f"@ ${pick.limit_price:.2f} (cost ${cost:.2f}) — {pick.reasoning}")
+
+
+def covered_call_phase(detector: RegimeDetector, state: BotState, regime: int, portfolio_value: float):
+    """Write short calls against 100-share stock lots. Optional auto-acquire
+    gated by stock_max_daily_usd cap — skips cleanly if the cap is too low."""
+    from core.options_data import get_option_chain, pick_contract, _clients
+
+    if not supports_options():
+        logger.warning("CC: broker does not support options — skipping covered-call phase.")
+        return
+
+    cfg = rc.load()
+    regime_name = detector.regime_name(regime)
+
+    # ── 1. Close existing short calls at TP / DTE ──────────────────────────────
+    for key, pos in list(state.options_positions.items()):
+        if not pos.is_short or pos.strategy != "short_call_covered":
+            continue
+        current_premium = 0.0
+        try:
+            data_client, _ = _clients()
+            from alpaca.data.requests import OptionSnapshotRequest
+            snaps = data_client.get_option_snapshot(
+                OptionSnapshotRequest(symbol_or_symbols=[pos.contract_symbol])
+            )
+            snap = snaps.get(pos.contract_symbol)
+            quote = getattr(snap, "latest_quote", None) if snap else None
+            if quote:
+                bid = float(getattr(quote, "bid_price", 0) or 0)
+                ask = float(getattr(quote, "ask_price", 0) or 0)
+                if bid > 0 and ask > 0:
+                    current_premium = (bid + ask) / 2
+        except Exception as e:
+            logger.warning(f"CC snapshot {pos.contract_symbol}: {e}")
+            continue
+        if current_premium <= 0:
+            continue
+
+        should_exit, reason = RiskManager.should_exit_option(
+            pos.entry_premium, current_premium, pos.dte(), is_short=True
+        )
+        if not should_exit:
+            continue
+        # Buy-to-close slightly above mid
+        limit = round(current_premium * 1.02, 2)
+        order_id = buy_option(pos.contract_symbol, abs(pos.qty), limit,
+                              regime_name=f"{regime_name} CC_close")
+        if order_id:
+            pnl = state.close_option_position(pos.contract_symbol, current_premium)
+            logger.info(f"CC CLOSED {pos.contract_symbol} x{abs(pos.qty)} @ ${current_premium:.2f} | "
+                        f"P&L ${pnl:+.2f} | {reason}")
+
+    # Write calls only in non-bearish regimes — don't cap upside into a rebound.
+    if regime_name in ("crash", "bear"):
+        logger.info(f"CC: skipping writes in {regime_name} regime")
+        return
+
+    try:
+        stock_holdings = get_stock_positions()
+    except Exception as e:
+        logger.warning(f"CC get_stock_positions: {e}")
+        stock_holdings = {}
+
+    watchlist = rc.get_watchlist()
+    already_short = {p.underlying for p in state.options_positions.values() if p.is_short}
+
+    target_delta = cfg.get("covered_call_target_delta", 0.25)
+    dte_min = int(cfg.get("covered_call_target_dte_min", 30))
+    dte_max = int(cfg.get("covered_call_target_dte_max", 45))
+
+    # ── 2. Write calls against eligible holdings ───────────────────────────────
+    wrote_any = False
+    for sym, qty in stock_holdings.items():
+        if sym not in watchlist or qty < 100 or sym in already_short:
+            continue
+        lots = int(qty // 100)
+        chain = get_option_chain(sym, dte_min=dte_min, dte_max=dte_max, sides=["call"])
+        if not chain:
+            logger.info(f"CC {sym}: no call chain in {dte_min}-{dte_max} DTE")
+            continue
+        target = pick_contract(chain, target_delta=target_delta, side="call")
+        if not target or target.mid <= 0.05:
+            logger.info(f"CC {sym}: no suitable OTM call near {target_delta}Δ")
+            continue
+        limit = round(max(target.mid * 0.98, 0.05), 2)
+        order_id = sell_option(target.symbol, lots, limit,
+                               reason="open_covered_call", regime_name=regime_name)
+        if not order_id:
+            continue
+        state.options_positions[target.symbol] = OptionsPosition(
+            contract_symbol=target.symbol,
+            underlying=sym,
+            side="call",
+            strike=target.strike,
+            expiry=target.expiry.isoformat() if hasattr(target.expiry, "isoformat") else str(target.expiry),
+            qty=-lots,  # negative = short
+            entry_premium=limit,
+            entry_date=datetime.now(timezone.utc).date().isoformat(),
+            regime_at_entry=regime_name,
+            strategy="short_call_covered",
+        )
+        state.save()
+        credit = limit * lots * 100
+        logger.info(f"CC OPENED {target.symbol} x{lots} @ ${limit:.2f} (credit ${credit:.2f}) "
+                    f"— {sym} held {qty}, Δ={target.delta:.2f}, DTE={target.dte}")
+        wrote_any = True
+
+    # ── 3. Optional auto-acquire — strict cap enforcement ──────────────────────
+    if not wrote_any and cfg.get("covered_call_auto_acquire", False):
+        stock_cap = cfg.get("stock_max_daily_usd", 5000.0)
+        remaining = stock_cap - state.daily_spent
+        candidates = []
+        for sym in watchlist:
+            if sym in stock_holdings and stock_holdings[sym] >= 100:
+                continue
+            price = latest_quote(sym)
+            if not price or price <= 0:
+                continue
+            cost = price * 100
+            candidates.append((cost, sym, price))
+        candidates.sort()
+        affordable = [c for c in candidates if c[0] <= remaining]
+        if not affordable:
+            cheapest = candidates[0] if candidates else None
+            if cheapest:
+                logger.info(
+                    f"CC auto-acquire: no symbol fits ${remaining:.0f} remaining cap "
+                    f"(cheapest: {cheapest[1]} @ ${cheapest[2]:.2f} × 100 = ${cheapest[0]:.0f}). "
+                    f"Raise stock_max_daily_usd to enable."
+                )
+            return
+        cost, sym, price = affordable[0]
+        verdict = RiskManager.check_daily_spend(state, cost)
+        if not verdict.allowed:
+            logger.warning(f"CC auto-acquire {sym}: {verdict.reason}")
+            return
+        order_id = buy_fractional(sym, verdict.adjusted_dollars,
+                                  regime_name=f"{regime_name} CC_acquire")
+        if order_id:
+            state.daily_spent += verdict.adjusted_dollars
+            state.save()
+            logger.info(f"CC ACQUIRED {sym}: ${verdict.adjusted_dollars:.2f} for ~100 shares @ "
+                        f"${price:.2f}. Writing call on next cycle after fill.")
+
+
 def main_loop():
-    logger.info(f"🚀 AI Swing Trader starting (mode={TRADING_MODE})")
+    logger.info(f"🚀 Montrai starting (mode={TRADING_MODE})")
 
     if TRADING_MODE == "live":
         login()
@@ -149,35 +453,63 @@ def main_loop():
     if detector.model is None:
         detector = train_phase(detector)
 
-    cycles = 0
-
     while True:
         cfg = rc.load()
         signal_interval = cfg["signal_interval_minutes"]
         retrain_every = max(1, int(7 * 24 * 60 / signal_interval))
+        stocks_on  = cfg.get("stock_trading_enabled", False)
+        options_on = cfg.get("options_trading_enabled", True)
 
         if RiskManager.check_lockout():
             logger.critical("Lockout file present. Sleeping 60s and re-checking.")
+            write_heartbeat(state, regime=-1, regime_name="lockout", mode="halted")
             time.sleep(60)
             continue
 
         if not is_market_open():
             logger.info("Market closed. Sleeping 5 minutes.")
+            write_heartbeat(state, regime=-1, regime_name="market_closed", mode="sleeping")
             time.sleep(300)
             continue
 
         try:
-            portfolio_value = get_portfolio_value() if TRADING_MODE == "live" else state.peak_equity or 10000.0
+            # Paper mode against Alpaca still has a real simulated equity balance —
+            # pull it from the broker so drawdown tracking uses the actual $100k
+            # starting equity, not a hard-coded $10k fallback.
+            try:
+                portfolio_value = get_portfolio_value()
+                if not portfolio_value or portfolio_value <= 0:
+                    portfolio_value = state.peak_equity or 100000.0
+            except Exception:
+                portfolio_value = state.peak_equity or 100000.0
             regime = monitor_phase(detector, state, portfolio_value)
-            execute_phase(detector, state, regime, portfolio_value)
 
-            cycles += 1
-            if cycles % retrain_every == 0:
+            if stocks_on:
+                execute_phase(detector, state, regime, portfolio_value)
+            else:
+                logger.info("Stock trading disabled — skipping stock execute phase.")
+            if options_on:
+                options_execute_phase(detector, state, regime, portfolio_value)
+            else:
+                logger.info("Options trading disabled — skipping options execute phase.")
+            if cfg.get("covered_call_enabled", False):
+                covered_call_phase(detector, state, regime, portfolio_value)
+
+            state.cycles += 1
+            state.save()
+            write_heartbeat(state, regime, detector.regime_name(regime),
+                            mode=("options" if options_on else "idle") if not stocks_on
+                                 else ("both" if options_on else "stocks"))
+            if state.cycles % retrain_every == 0:
                 detector = train_phase(detector)
 
         except KeyboardInterrupt:
             logger.info("Interrupted by user. Saving state.")
             state.save()
+            try:
+                os.remove(HEARTBEAT_FILE)
+            except Exception:
+                pass
             break
         except Exception as e:
             logger.error(f"Unhandled error in main loop: {e}", exc_info=True)
@@ -186,16 +518,141 @@ def main_loop():
         time.sleep(signal_interval * 60)
 
 
+def backtest_all():
+    """Run walk-forward backtest on every symbol in the watchlist. Save combined CSV."""
+    from backtester.walk_forward import run_walk_forward
+    from pathlib import Path
+    from config.settings import LOG_DIR
+
+    watchlist = rc.get_watchlist()
+    logger.info(f"Running full-watchlist backtest: {watchlist}")
+
+    all_folds = []
+    for sym in watchlist:
+        fold_df = run_walk_forward(sym)
+        if not fold_df.empty:
+            all_folds.append(fold_df)
+
+    if not all_folds:
+        logger.warning("No backtest results produced.")
+        return
+
+    combined = (
+        pd.concat(all_folds)
+        .groupby("symbol", as_index=False)
+        .agg(
+            folds=("n_trades", "count"),
+            total_trades=("n_trades", "sum"),
+            mean_return_pct=("total_return_pct", "mean"),
+            mean_win_rate=("win_rate", "mean"),
+            best_fold_pct=("total_return_pct", "max"),
+            worst_fold_pct=("total_return_pct", "min"),
+        )
+        .sort_values("mean_return_pct", ascending=False)
+        .round(3)
+    )
+
+    from datetime import datetime as _dt
+    Path(LOG_DIR).mkdir(exist_ok=True)
+    out = Path(LOG_DIR) / f"backtest_all_{_dt.today().strftime('%Y%m%d')}.csv"
+    combined.to_csv(out, index=False)
+
+    print("\n═══ BACKTEST SUMMARY (all symbols) ═══")
+    print(combined.to_string(index=False))
+    print(f"\nFull results saved → {out}")
+    print("Per-symbol fold detail + trades in logs/backtest_<SYMBOL>_*.csv")
+
+
+def scan_watchlist():
+    """Score every watchlist symbol right now. Print ranked table. Save to CSV."""
+    from pathlib import Path
+    from datetime import datetime as _dt
+    from config.settings import LOG_DIR
+
+    watchlist = rc.get_watchlist()
+    detector = RegimeDetector.load()
+    if detector.model is None:
+        logger.info("No saved HMM model — training now...")
+        detector = train_phase(detector)
+
+    spy_df = fetch_historical("SPY", days=120)
+    spy_features = build_hmm_features(add_indicators(spy_df)) if not spy_df.empty else None
+    regime = detector.predict_regime(spy_features) if spy_features is not None and len(spy_features) else 2
+    regime_name = detector.regime_name(regime)
+    logger.info(f"Current regime: {regime} ({regime_name.upper()})")
+
+    rows = []
+    for sym in watchlist:
+        df = fetch_historical(sym, days=120)
+        if df.empty or len(df) < 65:
+            continue
+        sig = swing_signal(df, symbol=sym)
+        price = latest_quote(sym) or 0.0
+        row = {
+            "symbol": sym,
+            "score": sig["score"],
+            "price": round(price, 2),
+            "rsi": round(sig["last"].get("rsi_14", 0), 1),
+            "macd_hist": round(sig["last"].get("macd_hist", 0), 4),
+            "bb_pos": round(sig["last"].get("bb_position", 0.5), 2),
+            "vol_ratio": round(sig["last"].get("vol_ratio", 1.0), 2),
+            "reasons": " | ".join(sig["reasons"]),
+        }
+        fund = sig.get("fundamentals", {})
+        if fund:
+            row["pe"] = fund.get("pe", "")
+            row["margin"] = fund.get("margin", "")
+            row["insider"] = fund.get("insider_score", "")
+            row["eps_revision"] = fund.get("eps_revision_pct", "")
+        rows.append(row)
+
+    if not rows:
+        print("No signals generated.")
+        return
+
+    result = (
+        pd.DataFrame(rows)
+        .sort_values("score", ascending=False)
+        .reset_index(drop=True)
+    )
+    result.insert(0, "rank", result.index + 1)
+
+    # Mark top candidates clearly
+    top = result[result["score"] >= 0.6]
+    watchable = result[(result["score"] >= 0.4) & (result["score"] < 0.6)]
+
+    print(f"\n═══ WATCHLIST SCAN — {_dt.today().strftime('%Y-%m-%d')} | Regime: {regime_name.upper()} ═══")
+    if not top.empty:
+        print(f"\n🟢 BUY CANDIDATES (score ≥ 0.6) — {len(top)} symbol(s):")
+        print(top.to_string(index=False))
+    if not watchable.empty:
+        print(f"\n🟡 WATCHING (0.4 ≤ score < 0.6) — {len(watchable)} symbol(s):")
+        print(watchable[["rank", "symbol", "score", "price", "rsi", "reasons"]].to_string(index=False))
+    print(f"\n⬜ Full ranked table ({len(result)} symbols):")
+    print(result[["rank", "symbol", "score", "price", "rsi", "reasons"]].to_string(index=False))
+
+    Path(LOG_DIR).mkdir(exist_ok=True)
+    out = Path(LOG_DIR) / f"scan_{_dt.today().strftime('%Y%m%d_%H%M')}.csv"
+    result.to_csv(out, index=False)
+    print(f"\nSaved → {out}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AI Swing Trader")
-    parser.add_argument("--backtest", action="store_true", help="Run walk-forward backtest")
+    parser.add_argument("--backtest", action="store_true", help="Walk-forward backtest for one symbol")
+    parser.add_argument("--backtest-all", action="store_true", help="Walk-forward backtest for all watchlist symbols")
+    parser.add_argument("--scan", action="store_true", help="Score all watchlist symbols now — ranked buy candidates")
     parser.add_argument("--train", action="store_true", help="Retrain HMM only")
-    parser.add_argument("--symbol", default="AAPL", help="Symbol for backtest")
+    parser.add_argument("--symbol", default="AAPL", help="Symbol for --backtest")
     args = parser.parse_args()
 
     if args.backtest:
         from backtester.walk_forward import run_walk_forward
         run_walk_forward(args.symbol)
+    elif args.backtest_all:
+        backtest_all()
+    elif args.scan:
+        scan_watchlist()
     elif args.train:
         d = RegimeDetector.load()
         train_phase(d)

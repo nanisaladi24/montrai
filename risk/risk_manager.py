@@ -36,18 +36,35 @@ class RiskManager:
             return True
         return False
 
-    # ── Circuit Breaker 2: Daily spend cap ───────────────────────────────────
+    # ── Circuit Breaker 2a: Stock daily spend cap ─────────────────────────────
     @staticmethod
     def check_daily_spend(state: BotState, proposed_dollars: float) -> RiskVerdict:
         state.reset_daily_if_new_day()
-        max_daily = rc.load().get("max_daily_spend_usd", _cfg.MAX_DAILY_SPEND_USD)
+        cfg = rc.load()
+        max_daily = cfg.get("stock_max_daily_usd",
+                            cfg.get("max_daily_spend_usd", _cfg.STOCK_MAX_DAILY_USD))
         remaining = max_daily - state.daily_spent
         if remaining <= 0:
-            return RiskVerdict(False, f"Daily spend cap hit (${max_daily})", 0.0)
+            return RiskVerdict(False, f"Stock daily spend cap hit (${max_daily})", 0.0)
         allowed = min(proposed_dollars, remaining)
         if allowed < proposed_dollars:
-            logger.warning(f"Trade size trimmed to ${allowed:.2f} (daily cap ${max_daily})")
-        return RiskVerdict(True, "within daily cap", allowed)
+            logger.warning(f"Stock trade size trimmed to ${allowed:.2f} (daily cap ${max_daily})")
+        return RiskVerdict(True, "within stock daily cap", allowed)
+
+    # ── Circuit Breaker 2b: Options daily premium cap ─────────────────────────
+    @staticmethod
+    def check_options_daily_spend(state: BotState, proposed_dollars: float) -> RiskVerdict:
+        """Options premium cap is *separate* from the stock cap. Hitting the
+        $1000/day options limit does not affect the stock budget and vice-versa."""
+        state.reset_daily_if_new_day()
+        max_daily = rc.load().get("options_max_daily_usd", _cfg.OPTIONS_MAX_DAILY_USD)
+        remaining = max_daily - state.options_daily_spent
+        if remaining <= 0:
+            return RiskVerdict(False, f"Options daily cap hit (${max_daily})", 0.0)
+        allowed = min(proposed_dollars, remaining)
+        if allowed < proposed_dollars:
+            logger.warning(f"Options premium trimmed to ${allowed:.2f} (daily cap ${max_daily})")
+        return RiskVerdict(True, "within options daily cap", allowed)
 
     # ── Circuit Breaker 3: Daily loss trigger ─────────────────────────────────
     @staticmethod
@@ -123,3 +140,56 @@ class RiskManager:
         stop_loss = round(entry_price * (1 - sl_pct), 4)
         take_profit = round(entry_price * (1 + tp_pct), 4)
         return stop_loss, take_profit
+
+    # ── Options pre-trade approval ────────────────────────────────────────────
+    @staticmethod
+    def approve_options_trade(
+        contract_symbol: str,
+        proposed_dollars: float,
+        state: BotState,
+    ) -> RiskVerdict:
+        if RiskManager.check_lockout():
+            return RiskVerdict(False, "bot is locked out", 0.0)
+        verdict = RiskManager.check_options_daily_spend(state, proposed_dollars)
+        if not verdict.allowed:
+            return verdict
+        logger.info(f"Options trade approved: {contract_symbol} ${verdict.adjusted_dollars:.2f}")
+        return verdict
+
+    # ── Options exit rules ────────────────────────────────────────────────────
+    @staticmethod
+    def should_exit_option(
+        entry_premium: float,
+        current_premium: float,
+        dte: int,
+        is_short: bool = False,
+    ) -> Tuple[bool, str]:
+        """Direction-aware exit check.
+
+        Long: TP when current ≥ entry × (1+TP); SL when current ≤ entry × (1-SL).
+        Short: TP when decay ≥ TP (current ≤ entry × (1-TP));
+               SL when current ≥ entry × 2 (premium doubled against us).
+        """
+        cfg = rc.load()
+        tp = cfg.get("options_take_profit_pct", _cfg.OPTIONS_TAKE_PROFIT_PCT)
+        sl = cfg.get("options_stop_loss_pct", _cfg.OPTIONS_STOP_LOSS_PCT)
+        min_dte = cfg.get("options_min_dte_exit", _cfg.OPTIONS_MIN_DTE_EXIT)
+        if entry_premium <= 0:
+            return False, ""
+        if is_short:
+            decay = (entry_premium - current_premium) / entry_premium  # +ve = profit
+            if decay >= tp:
+                return True, f"short TP decay {decay:.1%}"
+            if current_premium >= entry_premium * 2:
+                return True, f"short SL premium doubled ({current_premium:.2f} vs entry {entry_premium:.2f})"
+            if dte <= min_dte:
+                return True, f"DTE {dte} ≤ {min_dte}"
+            return False, ""
+        change = (current_premium - entry_premium) / entry_premium
+        if change >= tp:
+            return True, f"take-profit hit (+{change:.1%})"
+        if change <= -sl:
+            return True, f"stop-loss hit ({change:.1%})"
+        if dte <= min_dte:
+            return True, f"DTE {dte} ≤ {min_dte}"
+        return False, ""

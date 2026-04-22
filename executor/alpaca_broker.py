@@ -153,6 +153,99 @@ class AlpacaBroker(BrokerBase):
             logger.error(f"get_open_positions: {e}")
             return {}
 
+    # ── Options ───────────────────────────────────────────────────────────────
+
+    def supports_options(self) -> bool:
+        return True
+
+    def buy_option(self, contract_symbol: str, qty: int, limit_price: float,
+                   regime_name: str = "") -> Optional[str]:
+        """Open a long option position (BUY_TO_OPEN). Single-leg limit order."""
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+            from alpaca.trading.requests import LimitOrderRequest
+            req = LimitOrderRequest(
+                symbol=contract_symbol,
+                qty=qty,
+                limit_price=round(limit_price, 2),
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.SIMPLE,
+            )
+            order = self._trading.submit_order(req)
+            order_id = str(order.id)
+            log_trade(contract_symbol, "BUY_OPT", qty, limit_price,
+                      "open_long", regime_name, order_id)
+            logger.info(f"BUY_OPT {contract_symbol} x{qty} @ ${limit_price:.2f} → {order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"buy_option({contract_symbol} x{qty}): {e}")
+            return None
+
+    def sell_option(self, contract_symbol: str, qty: int, limit_price: float,
+                    reason: str = "", regime_name: str = "") -> Optional[str]:
+        """Close a long option position (SELL_TO_CLOSE). Single-leg limit order."""
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+            from alpaca.trading.requests import LimitOrderRequest
+            req = LimitOrderRequest(
+                symbol=contract_symbol,
+                qty=qty,
+                limit_price=round(limit_price, 2),
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                order_class=OrderClass.SIMPLE,
+            )
+            order = self._trading.submit_order(req)
+            order_id = str(order.id)
+            log_trade(contract_symbol, "SELL_OPT", qty, limit_price,
+                      reason or "close_long", regime_name, order_id)
+            logger.info(f"SELL_OPT {contract_symbol} x{qty} @ ${limit_price:.2f} reason={reason} → {order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"sell_option({contract_symbol}): {e}")
+            return None
+
+    def get_stock_positions(self) -> dict[str, float]:
+        """Only non-option positions keyed by symbol → qty."""
+        try:
+            positions = self._trading.get_all_positions()
+        except Exception as e:
+            logger.error(f"get_stock_positions: {e}")
+            return {}
+        out: dict[str, float] = {}
+        for p in positions:
+            asset_class = str(getattr(p, "asset_class", "")).lower()
+            if asset_class and "option" in asset_class:
+                continue
+            out[p.symbol] = float(p.qty)
+        return out
+
+    def get_option_positions(self) -> list[dict]:
+        """Return list of option positions held at the broker.
+
+        Each item: {symbol, qty, avg_entry_price, current_price, unrealized_pl}.
+        """
+        try:
+            positions = self._trading.get_all_positions()
+        except Exception as e:
+            logger.error(f"get_option_positions: {e}")
+            return []
+        out = []
+        for p in positions:
+            asset_class = str(getattr(p, "asset_class", "")).lower()
+            if "option" not in asset_class:
+                continue
+            out.append({
+                "symbol": p.symbol,
+                "qty": int(float(p.qty)),
+                "avg_entry_price": float(p.avg_entry_price or 0),
+                "current_price": float(getattr(p, "current_price", 0) or 0),
+                "unrealized_pl": float(getattr(p, "unrealized_pl", 0) or 0),
+                "market_value": float(getattr(p, "market_value", 0) or 0),
+            })
+        return out
+
     # ── Data helpers ──────────────────────────────────────────────────────────
 
     def _latest_price(self, symbol: str) -> float:

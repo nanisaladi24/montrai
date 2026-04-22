@@ -68,3 +68,38 @@ def cancel_order(order_id: str) -> bool:
 
 def get_open_positions() -> dict[str, float]:
     return get_broker().get_open_positions()
+
+
+# ── Options wrappers (no-op for brokers that don't support them) ──────────────
+
+def supports_options() -> bool:
+    try:
+        return get_broker().supports_options()
+    except Exception:
+        return False
+
+
+def buy_option(contract_symbol: str, qty: int, limit_price: float,
+               regime_name: str = "") -> Optional[str]:
+    return get_broker().buy_option(contract_symbol, qty, limit_price, regime_name)
+
+
+def sell_option(contract_symbol: str, qty: int, limit_price: float,
+                reason: str = "", regime_name: str = "") -> Optional[str]:
+    return get_broker().sell_option(contract_symbol, qty, limit_price, reason, regime_name)
+
+
+def get_option_positions() -> list[dict]:
+    try:
+        return get_broker().get_option_positions()
+    except Exception as e:
+        logger.error(f"get_option_positions: {e}")
+        return []
+
+
+def get_stock_positions() -> dict[str, float]:
+    try:
+        return get_broker().get_stock_positions()
+    except Exception as e:
+        logger.error(f"get_stock_positions: {e}")
+        return {}

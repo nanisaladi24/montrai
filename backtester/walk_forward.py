@@ -4,10 +4,13 @@ Trains on a rolling window then tests on the next out-of-sample window.
 """
 import numpy as np
 import pandas as pd
+from pathlib import Path
+from datetime import datetime
 from typing import List, Dict
 from config.settings import (
     BACKTEST_TRAIN_DAYS, BACKTEST_TEST_DAYS,
-    STOP_LOSS_PCT, TAKE_PROFIT_PCT, REGIME_ALLOCATION
+    STOP_LOSS_PCT, TAKE_PROFIT_PCT, REGIME_ALLOCATION,
+    LOG_DIR,
 )
 from core.market_data import fetch_historical
 from core.feature_engineering import add_indicators, build_hmm_features, swing_signal
@@ -21,6 +24,7 @@ def run_walk_forward(symbol: str, total_days: int = 756) -> pd.DataFrame:
     """
     Run walk-forward backtest for a single symbol.
     Returns a DataFrame of fold-level performance metrics.
+    Results are also saved to logs/backtest_{symbol}_{date}.csv.
     """
     logger.info(f"Walk-forward backtest: {symbol}, {total_days} days")
     df = fetch_historical(symbol, days=total_days)
@@ -30,13 +34,13 @@ def run_walk_forward(symbol: str, total_days: int = 756) -> pd.DataFrame:
 
     df = add_indicators(df)
     results = []
+    all_trades = []
     start = 0
 
     while start + BACKTEST_TRAIN_DAYS + BACKTEST_TEST_DAYS <= len(df):
         train_df = df.iloc[start : start + BACKTEST_TRAIN_DAYS]
         test_df  = df.iloc[start + BACKTEST_TRAIN_DAYS : start + BACKTEST_TRAIN_DAYS + BACKTEST_TEST_DAYS]
 
-        # Train regime detector on train window
         detector = RegimeDetector()
         train_features = build_hmm_features(train_df)
         if len(train_features) < 30:
@@ -50,19 +54,23 @@ def run_walk_forward(symbol: str, total_days: int = 756) -> pd.DataFrame:
             start += BACKTEST_TEST_DAYS
             continue
 
-        fold_trades = _simulate_trades(test_df, detector)
+        fold_trades = _simulate_trades(test_df, detector, symbol)
         if fold_trades:
             fold_df = pd.DataFrame(fold_trades)
             fold_pnl = fold_df["pnl_pct"].sum()
             win_rate = (fold_df["pnl_pct"] > 0).mean()
             results.append({
+                "symbol": symbol,
                 "fold_start": train_df.index[0].date(),
                 "fold_test_start": test_df.index[0].date(),
                 "n_trades": len(fold_trades),
                 "total_return_pct": round(fold_pnl * 100, 2),
                 "win_rate": round(win_rate, 3),
+                "avg_return_pct": round(fold_df["pnl_pct"].mean() * 100, 2),
                 "max_loss": round(fold_df["pnl_pct"].min() * 100, 2),
+                "max_gain": round(fold_df["pnl_pct"].max() * 100, 2),
             })
+            all_trades.extend(fold_trades)
 
         start += BACKTEST_TEST_DAYS
 
@@ -71,10 +79,24 @@ def run_walk_forward(symbol: str, total_days: int = 756) -> pd.DataFrame:
         logger.info(f"\n{result_df.to_string()}")
         logger.info(f"Mean return per fold: {result_df['total_return_pct'].mean():.2f}%")
         logger.info(f"Mean win rate: {result_df['win_rate'].mean():.2%}")
+        _save_backtest_results(symbol, result_df, pd.DataFrame(all_trades))
+
     return result_df
 
 
-def _simulate_trades(df: pd.DataFrame, detector: RegimeDetector) -> List[Dict]:
+def _save_backtest_results(symbol: str, folds: pd.DataFrame, trades: pd.DataFrame):
+    """Persist fold summary and individual trades to CSV under logs/."""
+    Path(LOG_DIR).mkdir(exist_ok=True)
+    date_str = datetime.today().strftime("%Y%m%d")
+    folds_path = Path(LOG_DIR) / f"backtest_{symbol}_{date_str}.csv"
+    trades_path = Path(LOG_DIR) / f"backtest_trades_{symbol}_{date_str}.csv"
+    folds.to_csv(folds_path, index=False)
+    if not trades.empty:
+        trades.to_csv(trades_path, index=False)
+    logger.info(f"Backtest saved → {folds_path}  |  trades → {trades_path}")
+
+
+def _simulate_trades(df: pd.DataFrame, detector: RegimeDetector, symbol: str = "") -> List[Dict]:
     trades = []
     i = 1
     while i < len(df) - 1:
@@ -111,11 +133,13 @@ def _simulate_trades(df: pd.DataFrame, detector: RegimeDetector) -> List[Dict]:
 
             pnl_pct = (exit_price - entry_price) / entry_price * alloc
             trades.append({
-                "entry": entry_price,
-                "exit": exit_price,
+                "symbol": symbol,
+                "entry_date": df.index[i].date() if hasattr(df.index[i], "date") else str(df.index[i])[:10],
+                "entry": round(entry_price, 4),
+                "exit": round(exit_price, 4),
+                "pnl_pct": round(pnl_pct * 100, 3),
                 "reason": exit_reason,
                 "regime": regime,
-                "pnl_pct": pnl_pct,
                 "signal_score": signal["score"],
             })
         else:

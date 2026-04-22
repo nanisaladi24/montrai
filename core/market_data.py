@@ -2,11 +2,16 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import pytz
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
 from monitoring.logger import get_logger
 
 logger = get_logger("market_data")
+
+# financial-datasets requires SEC-registered tickers. Index symbols and FX
+# aren't covered, so these specific tickers bypass financial-datasets and
+# go straight to yfinance (no paid subscription needed for free indices).
+_YFINANCE_ONLY = {"^VIX", "^VIX3M", "^VVIX", "DX-Y.NYB"}
 
 _ET = pytz.timezone("America/New_York")
 
@@ -57,22 +62,61 @@ def is_market_open() -> bool:
     return cfg.EXTENDED_HOURS_ENABLED and session in ("pre_market", "after_hours")
 
 
-def fetch_historical(symbol: str, days: int = 504, interval: str = "1d") -> pd.DataFrame:
-    """Fetch OHLCV history from Yahoo Finance."""
-    end = datetime.today()
+def _fetch_historical_fd(symbol: str, days: int) -> pd.DataFrame:
+    """Fetch daily OHLCV from financial-datasets. Returns empty frame on failure."""
+    try:
+        from core.financial_datasets import _get as _fd_get
+    except Exception:
+        return pd.DataFrame()
+    end = datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days + 30)
+    data = _fd_get("/prices", {
+        "ticker": symbol,
+        "interval": "day",
+        "interval_multiplier": 1,
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+    })
+    if not data:
+        return pd.DataFrame()
+    rows = data.get("prices") if isinstance(data, dict) else data
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    if df.empty or "time" not in df.columns:
+        return pd.DataFrame()
+    df["time"] = pd.to_datetime(df["time"])
+    df = df.set_index("time").sort_index()
+    df = df[["open", "high", "low", "close", "volume"]].dropna()
+    return df.tail(days)
+
+
+def _fetch_historical_yf(symbol: str, days: int, interval: str = "1d") -> pd.DataFrame:
+    """Fallback path — yfinance for indices / tickers financial-datasets can't resolve."""
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=days + 30)
     try:
         df = yf.download(symbol, start=start, end=end, interval=interval, auto_adjust=True, progress=False)
         if df.empty:
-            logger.warning(f"No data returned for {symbol}")
             return pd.DataFrame()
         df.index = pd.to_datetime(df.index)
         df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
         df.columns = ["open", "high", "low", "close", "volume"]
         return df.tail(days)
     except Exception as e:
-        logger.error(f"fetch_historical({symbol}): {e}")
+        logger.warning(f"yfinance fallback failed for {symbol}: {e}")
         return pd.DataFrame()
+
+
+def fetch_historical(symbol: str, days: int = 504, interval: str = "1d") -> pd.DataFrame:
+    """Fetch daily OHLCV. Prefers financial-datasets; falls back to yfinance
+    for index/FX symbols it can't serve (^VIX, ^VVIX, DX-Y.NYB, etc.)."""
+    if symbol in _YFINANCE_ONLY or interval != "1d":
+        return _fetch_historical_yf(symbol, days, interval)
+    df = _fetch_historical_fd(symbol, days)
+    if df.empty:
+        return _fetch_historical_yf(symbol, days, interval)
+    return df
 
 
 def fetch_multi(symbols: List[str], days: int = 504) -> dict[str, pd.DataFrame]:
@@ -91,6 +135,18 @@ def fetch_market_data_bulk(symbols: List[str], days: int = 252) -> pd.DataFrame:
 
 
 def latest_quote(symbol: str) -> Optional[float]:
+    """Latest trade price. Tries financial-datasets snapshot first, falls back to yfinance."""
+    if symbol not in _YFINANCE_ONLY:
+        try:
+            from core.financial_datasets import _get as _fd_get
+            data = _fd_get("/prices/snapshot", {"ticker": symbol})
+            if data:
+                snap = data.get("snapshot") if isinstance(data, dict) else None
+                price = (snap or {}).get("price")
+                if price is not None:
+                    return float(price)
+        except Exception as e:
+            logger.debug(f"financial-datasets snapshot for {symbol} failed: {e}")
     try:
         ticker = yf.Ticker(symbol)
         return float(ticker.fast_info.last_price)
@@ -110,7 +166,7 @@ def fetch_fred_features(api_key: str, days: int = 504) -> pd.DataFrame:
         "FEDFUNDS": "fed_funds_rate",      # Effective federal funds rate
         "BAMLH0A0HYM2": "hy_credit_spread", # High-yield OAS credit spread
     }
-    end = datetime.today()
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=days + 60)
     raw = {}
     for fred_id, col_name in series.items():
@@ -145,31 +201,67 @@ def fetch_macro_features(days: int = 504) -> pd.DataFrame:
     """
     Fetch macro/cross-asset features aligned to SPY trading days.
     Returns a DataFrame indexed by date with columns:
-      vix, vix3m, vix_term_ratio, tlt_ret, dxy_ret
-    Falls back gracefully — missing series are filled with 0.
+      vix, vix3m, vvix, vix_term_ratio, vvix_vix_ratio,
+      tlt_ret, dxy_ret, hyg_ret, smh_spy_rs
+
+    Data routing:
+      • VIX/VVIX/VIX3M indices → Polygon (if POLYGON_API_KEY set)
+      • ETFs (TLT, HYG, SMH, SPY) → financial-datasets via fetch_historical
+      • DXY (ICE futures, not SEC/Polygon) → yfinance fallback
+      Missing series are filled with 0 — canonical columns always present.
     """
-    symbols = {
-        "vix":   "^VIX",
-        "vix3m": "^VIX3M",
-        "vvix":  "^VVIX",   # vol-of-vol: early warning before VIX spikes
-        "tlt":   "TLT",
-        "dxy":   "DX-Y.NYB",
-        "hyg":   "HYG",     # high-yield credit: risk-on/off confirmation
-        "smh":   "SMH",     # semiconductor ETF: sector leadership proxy
-        "spy":   "SPY",     # needed for SMH/SPY relative strength
-    }
-    end = datetime.today()
+    raw: dict[str, pd.Series] = {}
+
+    # ── Indices: Polygon preferred, yfinance fallback ──────────────────────────
+    try:
+        from core.polygon_client import fetch_index_daily, is_configured as _poly_ok
+    except Exception:
+        _poly_ok = lambda: False  # noqa
+        fetch_index_daily = None   # noqa
+
+    if _poly_ok():
+        for key, poly_sym in [("vix", "VIX"), ("vix3m", "VIX3M"), ("vvix", "VVIX")]:
+            try:
+                s = fetch_index_daily(poly_sym, days=days + 60)
+                if not s.empty:
+                    raw[key] = s
+            except Exception as e:
+                logger.warning(f"polygon index {poly_sym}: {e}")
+
+    # yfinance fallback for any index that Polygon missed
+    end = datetime.now(timezone.utc)
     start = end - timedelta(days=days + 60)
-    raw = {}
-    for key, ticker in symbols.items():
+    index_yf_map = {"vix": "^VIX", "vix3m": "^VIX3M", "vvix": "^VVIX"}
+    for key, yf_sym in index_yf_map.items():
+        if key in raw:
+            continue
         try:
-            df = yf.download(ticker, start=start, end=end, interval="1d",
+            df = yf.download(yf_sym, start=start, end=end, interval="1d",
                              auto_adjust=True, progress=False)
             if not df.empty:
                 close_col = "Close" if "Close" in df.columns else df.columns[0]
                 raw[key] = df[close_col].squeeze()
         except Exception as e:
+            logger.warning(f"yfinance fallback {yf_sym}: {e}")
+
+    # ── ETFs via fetch_historical (financial-datasets primary) ─────────────────
+    for key, ticker in [("tlt", "TLT"), ("hyg", "HYG"), ("smh", "SMH"), ("spy", "SPY")]:
+        try:
+            df = fetch_historical(ticker, days=days + 60)
+            if not df.empty:
+                raw[key] = df["close"]
+        except Exception as e:
             logger.warning(f"fetch_macro_features: could not fetch {ticker}: {e}")
+
+    # ── DXY: yfinance only (not available as SEC or Polygon ticker) ────────────
+    try:
+        df = yf.download("DX-Y.NYB", start=start, end=end, interval="1d",
+                         auto_adjust=True, progress=False)
+        if not df.empty:
+            close_col = "Close" if "Close" in df.columns else df.columns[0]
+            raw["dxy"] = df[close_col].squeeze()
+    except Exception as e:
+        logger.warning(f"fetch_macro_features: could not fetch DX-Y.NYB: {e}")
 
     result = pd.DataFrame(raw)
 
@@ -225,12 +317,22 @@ def _bs_gamma(S: float, K: float, T: float, sigma: float, r: float = 0.04) -> fl
 
 def fetch_gex(symbol: str = "SPY", max_expiries: int = 4) -> dict:
     """
-    Calculate net Gamma Exposure (GEX) from the options chain.
+    Calculate net Gamma Exposure (GEX). Tries Alpaca options chain first
+    (broker-quoted Greeks), falls back to yfinance + local Black-Scholes.
+
     Returns:
       gex_total    — net GEX in $billions (positive = dealers long gamma)
       gex_per_spot — GEX normalised by spot price (scale-invariant)
-      gamma_flip   — strike closest to zero net gamma (price tends to gravitate here)
+      gamma_flip   — strike closest to zero net gamma (price gravitates here)
     """
+    try:
+        from core.options_data import fetch_gex_alpaca
+        alpaca_gex = fetch_gex_alpaca(symbol)
+        if alpaca_gex:
+            return alpaca_gex
+    except Exception as e:
+        logger.debug(f"Alpaca GEX unavailable, falling back to yfinance: {e}")
+
     try:
         ticker = yf.Ticker(symbol)
         spot = ticker.fast_info.last_price
@@ -238,7 +340,7 @@ def fetch_gex(symbol: str = "SPY", max_expiries: int = 4) -> dict:
             return {}
 
         expiries = ticker.options[:max_expiries]
-        today = datetime.today().date()
+        today = datetime.now(timezone.utc).date()
 
         total_call_gex = 0.0
         total_put_gex = 0.0

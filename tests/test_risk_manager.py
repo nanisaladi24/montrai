@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import pytest
 from core.position_tracker import BotState, Position
 from risk.risk_manager import RiskManager
-from config.settings import MAX_DAILY_SPEND_USD, STOP_LOSS_PCT, TAKE_PROFIT_PCT
+from config.settings import STOCK_MAX_DAILY_USD, STOP_LOSS_PCT, TAKE_PROFIT_PCT
 
 
 def make_state(spent=0.0) -> BotState:
@@ -16,13 +16,14 @@ def make_state(spent=0.0) -> BotState:
 
 
 def test_daily_cap_blocks_when_full():
-    state = make_state(spent=MAX_DAILY_SPEND_USD)
+    # check_daily_spend now enforces the stock cap, not the legacy combined cap.
+    state = make_state(spent=STOCK_MAX_DAILY_USD)
     verdict = RiskManager.check_daily_spend(state, 100.0)
     assert not verdict.allowed
 
 
 def test_daily_cap_trims_excess():
-    state = make_state(spent=MAX_DAILY_SPEND_USD - 50)
+    state = make_state(spent=STOCK_MAX_DAILY_USD - 50)
     verdict = RiskManager.check_daily_spend(state, 100.0)
     assert verdict.allowed
     assert verdict.adjusted_dollars == 50.0

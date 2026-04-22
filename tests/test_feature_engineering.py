@@ -38,7 +38,33 @@ def test_swing_signal_returns_score():
 
 
 def test_hmm_features_shape():
+    """Canonical schema is locked at 21 columns. reindex+fillna guarantees this
+    regardless of whether macro/FRED/GEX data was actually fetched."""
+    from core.feature_engineering import HMM_FEATURE_COLUMNS
     df = add_indicators(make_df())
     features = build_hmm_features(df)
     assert features.ndim == 2
-    assert features.shape[1] == 5
+    assert features.shape[1] == len(HMM_FEATURE_COLUMNS) == 21
+
+
+def test_hmm_features_no_nan():
+    df = add_indicators(make_df())
+    features = build_hmm_features(df)
+    import numpy as np
+    assert not np.isnan(features).any(), "Features must be NaN-free after fillna"
+
+
+def test_swing_signal_empty_df():
+    import pandas as pd
+    result = swing_signal(pd.DataFrame())
+    assert result["score"] == 0.0
+    assert result["reasons"] == []
+    assert result["last"] == {}
+
+
+def test_build_hmm_features_empty_df():
+    import pandas as pd
+    from core.feature_engineering import HMM_FEATURE_COLUMNS
+    features = build_hmm_features(pd.DataFrame())
+    # Empty input → empty matrix but correct column count
+    assert features.shape[1] == len(HMM_FEATURE_COLUMNS)
