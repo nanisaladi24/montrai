@@ -21,7 +21,7 @@ from config.settings import TRADING_MODE
 import config.runtime_config as rc
 from core.market_data import fetch_historical, latest_quote, is_market_open, current_session
 from core.feature_engineering import build_hmm_features, swing_signal, add_indicators
-from core.position_tracker import BotState, Position, OptionsPosition
+from core.position_tracker import BotState, Position, OptionsPosition, OptionLeg, MultiLegPosition
 from regime.hmm_engine import RegimeDetector
 from regime.strategies import get_regime_watchlist, compute_position_size, can_open_new_position
 from risk.risk_manager import RiskManager
@@ -29,6 +29,7 @@ from executor.order_executor import (
     login, get_portfolio_value, get_cash,
     buy_fractional, sell_all,
     supports_options, buy_option, sell_option, get_option_positions, get_stock_positions,
+    supports_multi_leg, submit_multi_leg_order,
 )
 from monitoring.logger import get_logger
 
@@ -38,20 +39,28 @@ HEARTBEAT_FILE = "bot_heartbeat.json"
 
 
 def write_heartbeat(state: BotState, regime: int, regime_name: str, mode: str):
-    """Dashboard reads this to show Running/Sleeping/Stopped. Written each cycle."""
+    """Dashboard reads this to show Running/Sleeping/Stopped + paper vs live.
+    Written each cycle."""
     try:
+        import config.settings as _cfg
         with open(HEARTBEAT_FILE, "w") as f:
             json.dump({
-                "ts": datetime.now(timezone.utc).isoformat() + "Z",
+                "ts": datetime.now(timezone.utc).isoformat(),
                 "pid": os.getpid(),
                 "regime": regime,
                 "regime_name": regime_name,
                 "session": current_session(),
                 "cycles": state.cycles,
                 "mode": mode,
+                "broker": _cfg.BROKER,
+                "trading_mode": _cfg.TRADING_MODE,
+                "alpaca_paper": getattr(_cfg, "ALPACA_PAPER", True),
                 "stock_trading_enabled":   rc.load().get("stock_trading_enabled", False),
                 "options_trading_enabled": rc.load().get("options_trading_enabled", True),
                 "intraday_enabled":        rc.load().get("intraday_enabled", False),
+                "spreads_enabled":         rc.load().get("spreads_enabled", False),
+                "iron_condor_enabled":     rc.load().get("iron_condor_enabled", False),
+                "covered_call_enabled":    rc.load().get("covered_call_enabled", False),
             }, f, indent=2)
     except Exception as e:
         logger.warning(f"write_heartbeat: {e}")
@@ -297,6 +306,181 @@ def options_execute_phase(detector: RegimeDetector, state: BotState, regime: int
                     f"@ ${pick.limit_price:.2f} (cost ${cost:.2f}) — {pick.reasoning}")
 
 
+def _fetch_option_mid(contract_symbol: str) -> float:
+    """Fetch current mid for a single option contract via Alpaca snapshot. 0 on failure."""
+    try:
+        from core.options_data import _clients
+        from alpaca.data.requests import OptionSnapshotRequest
+        data_client, _ = _clients()
+        snaps = data_client.get_option_snapshot(
+            OptionSnapshotRequest(symbol_or_symbols=[contract_symbol])
+        )
+        snap = snaps.get(contract_symbol)
+        quote = getattr(snap, "latest_quote", None) if snap else None
+        if quote:
+            bid = float(getattr(quote, "bid_price", 0) or 0)
+            ask = float(getattr(quote, "ask_price", 0) or 0)
+            if bid > 0 and ask > 0:
+                return (bid + ask) / 2
+    except Exception as e:
+        logger.warning(f"_fetch_option_mid({contract_symbol}): {e}")
+    return 0.0
+
+
+def _current_spread_value(pos: MultiLegPosition) -> float:
+    """Per-unit absolute dollars to close the spread right now."""
+    total = 0.0
+    for leg in pos.legs:
+        mid = _fetch_option_mid(leg.contract_symbol)
+        if mid <= 0:
+            return 0.0
+        if leg.side == "long":
+            total += mid   # we'd sell = give up this value
+        else:  # short — to close we buy back
+            total -= mid
+    return abs(total)
+
+
+def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfolio_value: float):
+    """Vertical spreads + iron condor execution."""
+    from executor.options_strategies import select_spread_trade, select_iron_condor
+    from core.market_data import latest_quote
+
+    logger.info("═══ MULTI-LEG EXECUTION PHASE ═══")
+    if not supports_multi_leg():
+        logger.warning("Broker does not support multi-leg orders — skipping.")
+        return
+
+    cfg = rc.load()
+    regime_name = detector.regime_name(regime)
+
+    # ── 1. Exits on existing multi-leg positions ───────────────────────────────
+    for key, pos in list(state.multi_leg_positions.items()):
+        current_value = _current_spread_value(pos)
+        if current_value <= 0:
+            continue
+        should_exit, reason = RiskManager.should_exit_multi_leg(
+            pos.net_entry, current_value, pos.qty, pos.dte()
+        )
+        if not should_exit:
+            continue
+        # Build closing legs: reverse each leg's side/intent
+        closing_legs = []
+        for leg in pos.legs:
+            closing_legs.append({
+                "contract_symbol": leg.contract_symbol,
+                "side": "sell" if leg.side == "long" else "buy",
+                "position_intent": "close",
+                "ratio_qty": 1,
+            })
+        # Closing a credit spread = BUY to close (net debit paid); closing a debit = SELL (net credit)
+        close_side = "buy" if pos.is_credit else "sell"
+        # Pay/receive current net value as limit
+        order_id = submit_multi_leg_order(
+            legs=closing_legs, qty=pos.unit_count, net_limit_price=current_value,
+            order_side=close_side, strategy=f"close_{pos.strategy}",
+            regime_name=regime_name,
+        )
+        if order_id:
+            pnl = state.close_multi_leg_position(key, current_value)
+            logger.info(f"MLEG CLOSED {pos.strategy} {pos.underlying} x{pos.unit_count} "
+                        f"@ net ${current_value:.2f} | P&L ${pnl:+.2f} | {reason}")
+
+    # ── 2. Entry scan ──────────────────────────────────────────────────────────
+    spreads_on = cfg.get("spreads_enabled", False)
+    ic_on      = cfg.get("iron_condor_enabled", False)
+    if not (spreads_on or ic_on):
+        logger.info("Spreads + iron condor disabled — skipping entries.")
+        return
+
+    max_daily = cfg.get("options_max_daily_usd", 1000.0)
+    remaining = max_daily - state.options_daily_spent
+    if remaining <= 50:
+        logger.info(f"Options daily cap ${max_daily} consumed — no new multi-leg entries.")
+        return
+
+    # Budget per new trade: spread across up to 3 fresh picks
+    open_count = len(state.multi_leg_positions)
+    slots_left = max(1, 3 - open_count)
+    per_trade_budget = min(remaining, remaining / slots_left)
+
+    watchlist = get_regime_watchlist(regime)
+    open_underlyings = {p.underlying for p in state.multi_leg_positions.values()}
+
+    picks: list = []
+    for symbol in watchlist:
+        if symbol in open_underlyings:
+            continue
+        df = fetch_historical(symbol, days=120)
+        if df.empty or len(df) < 65:
+            continue
+        sig = swing_signal(df, symbol=symbol)
+        score = sig.get("score", 0.0)
+
+        if spreads_on and abs(score) >= 0.6:
+            pick = select_spread_trade(symbol, score, regime_name, per_trade_budget)
+            if pick:
+                picks.append(pick)
+                continue
+        if ic_on and abs(score) < 0.30:
+            spot = latest_quote(symbol)
+            if not spot:
+                continue
+            pick = select_iron_condor(symbol, score, regime_name, spot, per_trade_budget)
+            if pick:
+                picks.append(pick)
+
+    picks.sort(key=lambda p: abs(p.score), reverse=True)
+
+    for pick in picks:
+        if state.options_daily_spent + pick.capital_at_risk > max_daily:
+            logger.info(f"Skipping {pick.underlying} {pick.strategy}: cap-at-risk would exceed daily limit.")
+            continue
+        # Build leg requests for the broker
+        legs_req = []
+        for contract, side in pick.legs:
+            action = "buy" if side == "long" else "sell"
+            legs_req.append({
+                "contract_symbol": contract.symbol,
+                "side": action,
+                "position_intent": "open",
+                "ratio_qty": 1,
+            })
+        # Credit structures: order_side = "sell" (we receive). Debit: "buy".
+        order_side = "sell" if pick.qty < 0 else "buy"
+        qty = pick.qty if pick.qty > 0 else -pick.qty
+        order_id = submit_multi_leg_order(
+            legs=legs_req, qty=qty, net_limit_price=pick.net_limit,
+            order_side=order_side, strategy=pick.strategy, regime_name=regime_name,
+        )
+        if not order_id:
+            continue
+        # Track position
+        key = f"{pick.underlying}_{pick.strategy}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
+        tracker_legs = []
+        for contract, side in pick.legs:
+            tracker_legs.append(OptionLeg(
+                contract_symbol=contract.symbol,
+                side=side,
+                contract_type=contract.side,   # "call" | "put"
+                strike=contract.strike,
+                expiry=contract.expiry.isoformat() if hasattr(contract.expiry, "isoformat") else str(contract.expiry),
+                entry_price=contract.mid,
+                ratio_qty=1,
+            ))
+        state.multi_leg_positions[key] = MultiLegPosition(
+            key=key, strategy=pick.strategy, underlying=pick.underlying,
+            legs=tracker_legs, qty=pick.qty, net_entry=pick.net_limit,
+            entry_date=datetime.now(timezone.utc).date().isoformat(),
+            regime_at_entry=regime_name,
+        )
+        # Credit trades consume capital-at-risk against the daily cap (not premium)
+        state.options_daily_spent += pick.capital_at_risk
+        state.save()
+        logger.info(f"MLEG OPENED {pick.strategy} {pick.underlying} x{qty} "
+                    f"@ net ${pick.net_limit:.2f} — risk ${pick.capital_at_risk:.0f} — {pick.reasoning}")
+
+
 def covered_call_phase(detector: RegimeDetector, state: BotState, regime: int, portfolio_value: float):
     """Write short calls against 100-share stock lots. Optional auto-acquire
     gated by stock_max_daily_usd cap — skips cleanly if the cap is too low."""
@@ -492,6 +676,8 @@ def main_loop():
                 options_execute_phase(detector, state, regime, portfolio_value)
             else:
                 logger.info("Options trading disabled — skipping options execute phase.")
+            if options_on and (cfg.get("spreads_enabled", False) or cfg.get("iron_condor_enabled", False)):
+                multi_leg_execute_phase(detector, state, regime, portfolio_value)
             if cfg.get("covered_call_enabled", False):
                 covered_call_phase(detector, state, regime, portfolio_value)
 

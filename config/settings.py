@@ -31,6 +31,19 @@ OPTIONS_MIN_DTE_EXIT    = 7          # Close when days-to-expiry drops below thi
 OPTIONS_TARGET_DTE      = (30, 45)   # Preferred expiry window at entry
 OPTIONS_TARGET_DELTA    = 0.40       # Target absolute delta for long-call/long-put strike
 
+# ── Multi-leg Spreads + Iron Condor ────────────────────────────────────────────
+# Phase 2: defined-risk vertical spreads and iron condors. Off by default —
+# flip via runtime.json or dashboard to activate.
+SPREADS_ENABLED          = os.getenv("SPREADS_ENABLED", "false").lower() == "true"
+IRON_CONDOR_ENABLED      = os.getenv("IRON_CONDOR_ENABLED", "false").lower() == "true"
+SPREAD_TARGET_SHORT_DELTA = 0.30    # Short leg of credit spread sits ~30Δ (typical)
+SPREAD_WING_WIDTH        = 5.0      # Dollar distance between short and long legs
+SPREAD_TAKE_PROFIT_PCT   = 0.50     # Close at 50% of max profit
+SPREAD_STOP_LOSS_PCT     = 0.50     # Close at 50% loss (of debit) / 2× credit received
+SPREAD_MIN_CREDIT        = 0.20     # Skip if credit < $0.20 per spread (not worth slippage)
+IRON_CONDOR_SHORT_DELTA  = 0.15     # Wider OTM for condors — lower assignment risk
+IRON_CONDOR_WING_WIDTH   = 5.0
+
 # ── Covered Calls ──────────────────────────────────────────────────────────────
 # Writes short calls against 100-share lots of underlyings on the watchlist.
 # Disabled by default because the $5000 stock cap can't buy 100 shares of most

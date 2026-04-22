@@ -206,6 +206,72 @@ class AlpacaBroker(BrokerBase):
             logger.error(f"sell_option({contract_symbol}): {e}")
             return None
 
+    # ── Multi-leg options (MLEG) ──────────────────────────────────────────────
+    def supports_multi_leg(self) -> bool:
+        return True
+
+    def submit_multi_leg_order(
+        self,
+        legs: list[dict],
+        qty: int,
+        net_limit_price: float,
+        order_side: str,
+        strategy: str = "",
+        regime_name: str = "",
+    ) -> Optional[str]:
+        """Submit a multi-leg (2-leg vertical or 4-leg iron condor) order to Alpaca.
+
+        legs item format: {"contract_symbol": "O:SPY...", "side": "buy"|"sell", "position_intent": "open"|"close"}
+
+        order_side: "buy" → net debit (we pay); "sell" → net credit (we receive).
+        Alpaca accepts the net limit price as a positive value regardless of direction;
+        the order_side distinguishes debit vs credit at the parent-order level.
+        """
+        try:
+            from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, PositionIntent
+            from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+        except ImportError:
+            logger.error("alpaca-py SDK missing MLEG types — upgrade alpaca-py")
+            return None
+
+        intent_map = {
+            ("buy", "open"):  PositionIntent.BUY_TO_OPEN,
+            ("sell", "open"): PositionIntent.SELL_TO_OPEN,
+            ("buy", "close"): PositionIntent.BUY_TO_CLOSE,
+            ("sell", "close"): PositionIntent.SELL_TO_CLOSE,
+        }
+        side_map = {"buy": OrderSide.BUY, "sell": OrderSide.SELL}
+
+        try:
+            leg_reqs = []
+            for lg in legs:
+                intent = intent_map[(lg["side"], lg["position_intent"])]
+                leg_reqs.append(OptionLegRequest(
+                    symbol=lg["contract_symbol"],
+                    side=side_map[lg["side"]],
+                    position_intent=intent,
+                    ratio_qty=lg.get("ratio_qty", 1),
+                ))
+            req = LimitOrderRequest(
+                qty=qty,
+                order_class=OrderClass.MLEG,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(abs(net_limit_price), 2),
+                side=side_map[order_side],
+                legs=leg_reqs,
+            )
+            order = self._trading.submit_order(req)
+            order_id = str(order.id)
+            leg_desc = " / ".join(f"{lg['side']} {lg['contract_symbol']}" for lg in legs)
+            log_trade(strategy or "MLEG", "MLEG", qty, net_limit_price,
+                      f"{order_side}_{strategy}", regime_name, order_id)
+            logger.info(f"MLEG {strategy} x{qty} @ net ${net_limit_price:.2f} ({order_side}): "
+                        f"{leg_desc} → {order_id}")
+            return order_id
+        except Exception as e:
+            logger.error(f"submit_multi_leg_order({strategy} x{qty}): {e}")
+            return None
+
     def get_stock_positions(self) -> dict[str, float]:
         """Only non-option positions keyed by symbol → qty."""
         try:

@@ -156,6 +156,41 @@ class RiskManager:
         logger.info(f"Options trade approved: {contract_symbol} ${verdict.adjusted_dollars:.2f}")
         return verdict
 
+    # ── Multi-leg spread exit rules ───────────────────────────────────────────
+    @staticmethod
+    def should_exit_multi_leg(
+        net_entry: float,          # absolute per-unit dollars at entry
+        current_net_value: float,  # absolute per-unit dollars to close now
+        qty: int,                  # signed: +N = long/debit, -N = short/credit
+        dte: int,
+    ) -> Tuple[bool, str]:
+        """Direction-aware exit for vertical spreads + iron condors.
+
+        Long spread (debit): TP when current ≥ entry × (1+tp); SL when current ≤ entry × (1-sl).
+        Short spread (credit): TP when current ≤ entry × (1-tp); SL when current ≥ entry × 2.
+        """
+        cfg = rc.load()
+        tp = cfg.get("spread_take_profit_pct", _cfg.SPREAD_TAKE_PROFIT_PCT)
+        sl = cfg.get("spread_stop_loss_pct",   _cfg.SPREAD_STOP_LOSS_PCT)
+        min_dte = cfg.get("options_min_dte_exit", _cfg.OPTIONS_MIN_DTE_EXIT)
+        if net_entry <= 0 or qty == 0:
+            return False, ""
+        if qty > 0:   # debit — we own it
+            pct = (current_net_value - net_entry) / net_entry
+            if pct >= tp:
+                return True, f"debit TP +{pct:.1%}"
+            if pct <= -sl:
+                return True, f"debit SL {pct:.1%}"
+        else:         # credit — we sold it
+            decay = (net_entry - current_net_value) / net_entry
+            if decay >= tp:
+                return True, f"credit TP decay {decay:.1%}"
+            if current_net_value >= net_entry * 2:
+                return True, f"credit SL ({current_net_value:.2f} vs entry {net_entry:.2f})"
+        if dte <= min_dte:
+            return True, f"DTE {dte} ≤ {min_dte}"
+        return False, ""
+
     # ── Options exit rules ────────────────────────────────────────────────────
     @staticmethod
     def should_exit_option(

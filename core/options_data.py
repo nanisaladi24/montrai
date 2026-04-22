@@ -168,6 +168,103 @@ def pick_contract(
     return min(candidates, key=lambda c: abs(c.delta - target))
 
 
+def pick_vertical_spread(
+    chain: list[OptionContract],
+    side: str,                      # "call" | "put"
+    short_delta: float = 0.30,
+    wing_width: float = 5.0,
+    direction: str = "credit",      # "credit" | "debit"
+) -> Optional[tuple[OptionContract, OptionContract]]:
+    """Return (short_leg, long_leg) for a vertical spread.
+
+    Credit: short_leg is nearer-the-money (higher premium), long_leg is further OTM.
+    Debit: long_leg is nearer-the-money, short_leg is further OTM (we sell the cheap OTM).
+
+    Returns None if a matched strike at `wing_width` doesn't exist in the chain
+    or liquidity is too thin.
+    """
+    same_side = [c for c in chain if c.side == side and c.bid > 0 and c.ask > 0
+                 and c.open_interest >= 20]
+    if not same_side:
+        return None
+    # All legs in the same expiry — pick the most-populated expiry to avoid
+    # cross-expiry spread picks.
+    from collections import Counter
+    exp_counts = Counter(c.expiry for c in same_side)
+    target_exp = exp_counts.most_common(1)[0][0]
+    same_side = [c for c in same_side if c.expiry == target_exp]
+
+    # Pick primary leg: credit → short at target_delta; debit → long at higher delta
+    if direction == "credit":
+        primary_target_delta = short_delta if side == "call" else -short_delta
+        primary = min(same_side, key=lambda c: abs(c.delta - primary_target_delta))
+    else:
+        # Debit: long leg is more ITM (~40-50Δ); short leg is far OTM wing protection
+        primary_target_delta = (short_delta + 0.20) if side == "call" else -(short_delta + 0.20)
+        primary = min(same_side, key=lambda c: abs(c.delta - primary_target_delta))
+
+    # Wing leg: for a call spread, the hedge strike is further above (credit) / below (debit)
+    # For a put spread, mirror. Direction of wing:
+    if side == "call":
+        wing_strike_target = primary.strike + wing_width if direction == "credit" else primary.strike - wing_width
+    else:  # put
+        wing_strike_target = primary.strike - wing_width if direction == "credit" else primary.strike + wing_width
+
+    wing_candidates = [c for c in same_side if c.strike != primary.strike]
+    if not wing_candidates:
+        return None
+    wing = min(wing_candidates, key=lambda c: abs(c.strike - wing_strike_target))
+
+    # Assign short/long based on direction
+    if direction == "credit":
+        return (primary, wing)  # short, long
+    else:
+        return (wing, primary)  # short (OTM hedge), long (ITM leg we bought)
+
+
+def pick_iron_condor(
+    chain: list[OptionContract],
+    spot: float,
+    short_delta: float = 0.15,
+    wing_width: float = 5.0,
+) -> Optional[tuple[OptionContract, OptionContract, OptionContract, OptionContract]]:
+    """Return (put_short, put_long, call_short, call_long) for a balanced iron condor.
+
+    Short strikes sit at ~short_delta OTM (lower-risk wings). Long strikes
+    protect by wing_width further OTM. All four legs share expiry.
+    """
+    put_pair = pick_vertical_spread(chain, "put", short_delta, wing_width, direction="credit")
+    call_pair = pick_vertical_spread(chain, "call", short_delta, wing_width, direction="credit")
+    if not put_pair or not call_pair:
+        return None
+    put_short, put_long = put_pair
+    call_short, call_long = call_pair
+    # Sanity — shorts must straddle spot
+    if put_short.strike >= spot or call_short.strike <= spot:
+        return None
+    return (put_short, put_long, call_short, call_long)
+
+
+def net_premium(legs: list[tuple[OptionContract, str]]) -> float:
+    """Compute per-unit net premium in dollars for a list of (contract, side) tuples.
+
+    side = "long" means we buy (pay mid) → adds to debit.
+    side = "short" means we sell (receive mid) → subtracts from debit.
+
+    Positive return = net debit (we pay). Negative = net credit (we receive).
+    """
+    net = 0.0
+    for contract, side in legs:
+        mid = contract.mid
+        if mid <= 0:
+            return 0.0
+        if side == "long":
+            net += mid
+        else:  # short
+            net -= mid
+    return net
+
+
 def compute_gex_from_chain(chain: list[OptionContract], spot: float) -> dict:
     """Net GEX from a pre-fetched chain. Uses broker-quoted gamma rather than BS."""
     if not chain or spot <= 0:

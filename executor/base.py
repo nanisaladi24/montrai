@@ -51,3 +51,18 @@ class BrokerBase(ABC):
 
     def get_stock_positions(self) -> dict[str, float]:
         return self.get_open_positions()
+
+    # ── Multi-leg options (verticals + iron condor) ──────────────────────────
+    def supports_multi_leg(self) -> bool:
+        return False
+
+    def submit_multi_leg_order(
+        self,
+        legs: list[dict],          # [{"contract_symbol", "side" ("buy"|"sell"), "position_intent" ("open"|"close")}, ...]
+        qty: int,                  # # of spread units (always positive — direction encoded in order_side)
+        net_limit_price: float,    # net debit (positive number, always)
+        order_side: str,           # "buy" = net debit / "sell" = net credit
+        strategy: str = "",        # for logging
+        regime_name: str = "",
+    ) -> Optional[str]:
+        raise NotImplementedError("Broker does not support multi-leg orders")

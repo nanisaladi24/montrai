@@ -22,6 +22,39 @@ HEARTBEAT_FILE = "bot_heartbeat.json"
 st.set_page_config(page_title="Montrai", layout="wide", page_icon="📈")
 
 
+def trading_mode_banner():
+    """Always-visible indicator of paper vs live trading at top of dashboard.
+    Pulls from the heartbeat first (authoritative at runtime), falls back to
+    settings.py if the bot hasn't written one yet."""
+    broker = "?"
+    mode = "?"
+    is_paper = True
+    try:
+        if Path(HEARTBEAT_FILE).exists():
+            hb = json.loads(Path(HEARTBEAT_FILE).read_text())
+            broker = hb.get("broker", "?")
+            mode = hb.get("trading_mode", "?")
+            is_paper = bool(hb.get("alpaca_paper", True)) if broker == "alpaca" else (mode != "live")
+        else:
+            import config.settings as _cfg
+            broker = _cfg.BROKER
+            mode = _cfg.TRADING_MODE
+            is_paper = getattr(_cfg, "ALPACA_PAPER", True) if broker == "alpaca" else (mode != "live")
+    except Exception:
+        pass
+
+    broker_label = broker.upper()
+    if is_paper or mode == "paper":
+        st.info(
+            f"📄 **PAPER TRADING** · broker: **{broker_label}** · simulated fills, no real money at risk"
+        )
+    else:
+        st.error(
+            f"🚨 **LIVE TRADING** · broker: **{broker_label}** · real money, real fills — "
+            "check positions + caps before enabling any new strategy"
+        )
+
+
 def bot_status_pill():
     """Read bot_heartbeat.json and render a status pill at the top of the page."""
     cfg = rc.load()
@@ -73,6 +106,7 @@ def bot_status_pill():
     )
 
 
+trading_mode_banner()
 bot_status_pill()
 
 tab_live, tab_options, tab_settings, tab_data = st.tabs(
@@ -191,9 +225,33 @@ with tab_options:
                 "Entry Date": p["entry_date"],
                 "Regime": p.get("regime_at_entry", "—"),
             })
+        st.subheader("Single-leg")
         st.dataframe(pd.DataFrame(rows), use_container_width=True)
     else:
-        st.info("No open options positions.")
+        st.info("No open single-leg options positions.")
+
+    # ── Multi-leg (spreads + iron condor) ──────────────────────────────────────
+    mleg = state_data.get("multi_leg_positions", {})
+    if mleg:
+        st.subheader("Multi-leg (spreads + iron condor)")
+        for key, p in mleg.items():
+            direction = "CREDIT" if p["qty"] < 0 else "DEBIT"
+            units = abs(p["qty"])
+            header = (f"**{p['strategy']}** · {p['underlying']} · {direction} "
+                      f"· {units} unit{'s' if units != 1 else ''} · net ${p['net_entry']:.2f} "
+                      f"· entered {p['entry_date']}")
+            with st.expander(header):
+                leg_rows = []
+                for leg in p["legs"]:
+                    leg_rows.append({
+                        "Leg": leg["side"].upper(),
+                        "Type": leg["contract_type"],
+                        "Strike": leg["strike"],
+                        "Expiry": leg["expiry"],
+                        "Contract": leg["contract_symbol"],
+                        "Entry mid": f"${leg['entry_price']:.2f}",
+                    })
+                st.dataframe(pd.DataFrame(leg_rows), use_container_width=True, hide_index=True)
 
     st.caption(
         f"Exit rules: take-profit +{cfg.get('options_take_profit_pct',0.5)*100:.0f}% · "
@@ -237,6 +295,23 @@ with tab_settings:
     with m3:
         intraday_on = st.toggle("Intraday trading", value=bool(cfg.get("intraday_enabled", False)),
                                 help="Phase 1: flag only. Phase 2 wires Alpaca minute bars + EOD-flatten logic.")
+
+    sp1, sp2, sp3 = st.columns(3)
+    with sp1:
+        sp_on = st.toggle("Vertical spreads", value=bool(cfg.get("spreads_enabled", False)),
+                          help="Bull-put / bear-call credit spreads (defined-risk directional).")
+        ic_on = st.toggle("Iron condor", value=bool(cfg.get("iron_condor_enabled", False)),
+                          help="Neutral strategy. Fires when |score| < 0.3 — collects premium on chop.")
+    with sp2:
+        sp_delta = st.slider("Spread short-leg Δ", min_value=0.10, max_value=0.45, step=0.05,
+                             value=float(cfg.get("spread_target_short_delta", 0.30)))
+        sp_width = st.number_input("Spread wing width ($)", min_value=1.0, max_value=50.0, step=1.0,
+                                   value=float(cfg.get("spread_wing_width", 5.0)))
+    with sp3:
+        ic_delta = st.slider("Iron condor short Δ", min_value=0.05, max_value=0.30, step=0.05,
+                             value=float(cfg.get("iron_condor_short_delta", 0.15)))
+        ic_width = st.number_input("Iron condor wing ($)", min_value=1.0, max_value=50.0, step=1.0,
+                                   value=float(cfg.get("iron_condor_wing_width", 5.0)))
 
     cc1, cc2, cc3 = st.columns(3)
     with cc1:
@@ -418,6 +493,12 @@ with tab_settings:
             "covered_call_target_delta":   float(cc_delta),
             "covered_call_target_dte_min": int(cc_dte_min),
             "covered_call_target_dte_max": int(cc_dte_max),
+            "spreads_enabled":           bool(sp_on),
+            "iron_condor_enabled":       bool(ic_on),
+            "spread_target_short_delta": float(sp_delta),
+            "spread_wing_width":         float(sp_width),
+            "iron_condor_short_delta":   float(ic_delta),
+            "iron_condor_wing_width":    float(ic_width),
         })
         rc.save(cfg)
         st.success("Settings saved. Bot will pick them up on the next cycle.")

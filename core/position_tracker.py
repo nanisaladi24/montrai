@@ -76,9 +76,104 @@ class OptionsPosition:
 
 
 @dataclass
+class OptionLeg:
+    """One leg of a multi-leg options position."""
+    contract_symbol: str   # OCC: O:SPY260619P00700000
+    side: str              # "long" | "short"
+    contract_type: str     # "call" | "put"
+    strike: float
+    expiry: str            # ISO date
+    entry_price: float     # per-contract mid at entry
+    ratio_qty: int = 1     # # of this leg per spread unit (always 1 for verticals & condors)
+
+
+@dataclass
+class MultiLegPosition:
+    """
+    A vertical spread (2 legs) or iron condor (4 legs).
+
+    net_entry is absolute per-unit dollars; `qty > 0` = long (paid the debit),
+    `qty < 0` = short (received the credit). Both are tracked as positive
+    dollar amounts — direction-aware math lives in unrealized_pnl + exit rules.
+    """
+    key: str                      # unique ID per position
+    strategy: str                 # bull_put_credit | bear_call_credit | bull_call_debit | bear_put_debit | iron_condor
+    underlying: str
+    legs: list                    # list of OptionLeg
+    qty: int                      # +N = long spread (debit paid), -N = short spread (credit received)
+    net_entry: float              # positive dollars per unit (|net debit| or |net credit|)
+    entry_date: str
+    regime_at_entry: str = "unknown"
+
+    @property
+    def is_credit(self) -> bool:
+        return self.qty < 0
+
+    @property
+    def unit_count(self) -> int:
+        return abs(self.qty)
+
+    @property
+    def width(self) -> float:
+        """Strike distance between short and long legs. For iron condor: max wing width."""
+        if not self.legs:
+            return 0.0
+        if len(self.legs) == 2:
+            return abs(self.legs[0].strike - self.legs[1].strike)
+        # Iron condor: compute max of put wing and call wing
+        calls = [l for l in self.legs if l.contract_type == "call"]
+        puts  = [l for l in self.legs if l.contract_type == "put"]
+        call_w = abs(calls[0].strike - calls[1].strike) if len(calls) == 2 else 0.0
+        put_w  = abs(puts[0].strike - puts[1].strike) if len(puts) == 2 else 0.0
+        return max(call_w, put_w)
+
+    @property
+    def max_profit(self) -> float:
+        """Per unit, in dollars (before × 100 and × qty)."""
+        if self.is_credit:
+            return self.net_entry
+        # Debit spread max profit = width - debit (assuming no black-swan)
+        return max(self.width - self.net_entry, 0.0)
+
+    @property
+    def max_loss(self) -> float:
+        """Per unit, in dollars (before × 100 and × qty)."""
+        if self.is_credit:
+            return max(self.width - self.net_entry, 0.0)
+        # Debit spread max loss = debit paid
+        return self.net_entry
+
+    @property
+    def capital_at_risk(self) -> float:
+        """Total $ the position can lose. Governs risk-approval sizing."""
+        return self.max_loss * self.unit_count * 100
+
+    def unrealized_pnl(self, current_net_value: float) -> float:
+        """current_net_value: current per-unit absolute mid cost-to-close in dollars.
+
+        Debit (qty>0): we own the spread worth $current → pnl = (current - entry) * qty * 100.
+        Credit (qty<0): we sold the spread; to close we pay $current → pnl = (entry - current) * |qty| * 100.
+        Unified with signed qty: pnl = (current - entry) * qty * 100.
+        """
+        return (current_net_value - self.net_entry) * self.qty * 100
+
+    def dte(self) -> int:
+        from datetime import date as _d
+        if not self.legs:
+            return 0
+        try:
+            # All legs share expiry for verticals/condors
+            exp = _d.fromisoformat(self.legs[0].expiry)
+            return (exp - _d.today()).days
+        except Exception:
+            return 0
+
+
+@dataclass
 class BotState:
     positions: Dict[str, Position] = field(default_factory=dict)
     options_positions: Dict[str, OptionsPosition] = field(default_factory=dict)
+    multi_leg_positions: Dict[str, "MultiLegPosition"] = field(default_factory=dict)
     daily_spent: float = 0.0                  # stock-buy notional today
     options_daily_spent: float = 0.0          # option-premium outlay today
     daily_date: str = ""
@@ -101,6 +196,7 @@ class BotState:
         data = {
             "positions": {sym: asdict(p) for sym, p in self.positions.items()},
             "options_positions": {k: asdict(p) for k, p in self.options_positions.items()},
+            "multi_leg_positions": {k: asdict(p) for k, p in self.multi_leg_positions.items()},
             "daily_spent": self.daily_spent,
             "options_daily_spent": self.options_daily_spent,
             "daily_date": self.daily_date,
@@ -133,6 +229,10 @@ class BotState:
                 state.positions[sym] = Position(**pdata)
             for key, odata in data.get("options_positions", {}).items():
                 state.options_positions[key] = OptionsPosition(**odata)
+            for key, mdata in data.get("multi_leg_positions", {}).items():
+                # Rebuild leg dataclasses from dict form
+                legs = [OptionLeg(**lg) for lg in mdata.pop("legs", [])]
+                state.multi_leg_positions[key] = MultiLegPosition(legs=legs, **mdata)
             return state
         except Exception as e:
             logger.error(f"Failed to load state: {e}. Starting fresh.")
@@ -151,6 +251,15 @@ class BotState:
         pos = self.options_positions.pop(contract_symbol, None)
         if pos:
             pnl = pos.unrealized_pnl(exit_premium)
+            self.options_realized_pnl += pnl
+            self.save()
+            return pnl
+        return 0.0
+
+    def close_multi_leg_position(self, key: str, exit_net_value: float):
+        pos = self.multi_leg_positions.pop(key, None)
+        if pos:
+            pnl = pos.unrealized_pnl(exit_net_value)
             self.options_realized_pnl += pnl
             self.save()
             return pnl

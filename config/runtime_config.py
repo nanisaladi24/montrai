@@ -37,6 +37,15 @@ from config.settings import (
     COVERED_CALL_TARGET_DELTA,
     COVERED_CALL_TARGET_DTE,
     COVERED_CALL_AUTO_ACQUIRE,
+    SPREADS_ENABLED,
+    IRON_CONDOR_ENABLED,
+    SPREAD_TARGET_SHORT_DELTA,
+    SPREAD_WING_WIDTH,
+    SPREAD_TAKE_PROFIT_PCT,
+    SPREAD_STOP_LOSS_PCT,
+    SPREAD_MIN_CREDIT,
+    IRON_CONDOR_SHORT_DELTA,
+    IRON_CONDOR_WING_WIDTH,
 )
 
 _RUNTIME_FILE = Path(__file__).parent / "runtime.json"
@@ -76,6 +85,16 @@ _DEFAULTS: dict[str, Any] = {
     "covered_call_target_dte_min":    COVERED_CALL_TARGET_DTE[0],
     "covered_call_target_dte_max":    COVERED_CALL_TARGET_DTE[1],
     "covered_call_auto_acquire":      COVERED_CALL_AUTO_ACQUIRE,
+    # Multi-leg spreads + iron condor
+    "spreads_enabled":              SPREADS_ENABLED,
+    "iron_condor_enabled":          IRON_CONDOR_ENABLED,
+    "spread_target_short_delta":    SPREAD_TARGET_SHORT_DELTA,
+    "spread_wing_width":            SPREAD_WING_WIDTH,
+    "spread_take_profit_pct":       SPREAD_TAKE_PROFIT_PCT,
+    "spread_stop_loss_pct":         SPREAD_STOP_LOSS_PCT,
+    "spread_min_credit":            SPREAD_MIN_CREDIT,
+    "iron_condor_short_delta":      IRON_CONDOR_SHORT_DELTA,
+    "iron_condor_wing_width":       IRON_CONDOR_WING_WIDTH,
 }
 
 

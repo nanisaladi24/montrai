@@ -103,3 +103,19 @@ def get_stock_positions() -> dict[str, float]:
     except Exception as e:
         logger.error(f"get_stock_positions: {e}")
         return {}
+
+
+def supports_multi_leg() -> bool:
+    try:
+        return get_broker().supports_multi_leg()
+    except Exception:
+        return False
+
+
+def submit_multi_leg_order(legs: list[dict], qty: int, net_limit_price: float,
+                           order_side: str, strategy: str = "",
+                           regime_name: str = "") -> Optional[str]:
+    return get_broker().submit_multi_leg_order(
+        legs=legs, qty=qty, net_limit_price=net_limit_price,
+        order_side=order_side, strategy=strategy, regime_name=regime_name,
+    )
