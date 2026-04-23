@@ -43,7 +43,8 @@ class OptionsPosition:
     entry_premium: float    # per-contract mid at entry (dollars)
     entry_date: str
     regime_at_entry: str = "unknown"
-    strategy: str = "long_call"   # long_call | long_put | short_call_covered | (future: spreads)
+    strategy: str = "long_call"   # long_call | long_put | short_call_covered | intraday_orb | forced_paper
+    intraday: bool = False        # True → force-close at EOD flatten window
 
     @property
     def is_short(self) -> bool:
@@ -176,6 +177,7 @@ class BotState:
     multi_leg_positions: Dict[str, "MultiLegPosition"] = field(default_factory=dict)
     daily_spent: float = 0.0                  # stock-buy notional today
     options_daily_spent: float = 0.0          # option-premium outlay today
+    intraday_daily_spent: float = 0.0         # intraday option premium today
     daily_date: str = ""
     peak_equity: float = 0.0
     is_halved: bool = False         # True when daily loss triggered halving
@@ -188,6 +190,7 @@ class BotState:
         if self.daily_date != today:
             self.daily_spent = 0.0
             self.options_daily_spent = 0.0
+            self.intraday_daily_spent = 0.0
             self.daily_date = today
             self.is_halved = False
             logger.info("Daily counters reset for new trading day.")
@@ -199,6 +202,7 @@ class BotState:
             "multi_leg_positions": {k: asdict(p) for k, p in self.multi_leg_positions.items()},
             "daily_spent": self.daily_spent,
             "options_daily_spent": self.options_daily_spent,
+            "intraday_daily_spent": self.intraday_daily_spent,
             "daily_date": self.daily_date,
             "peak_equity": self.peak_equity,
             "is_halved": self.is_halved,
@@ -219,6 +223,7 @@ class BotState:
             state = cls()
             state.daily_spent = data.get("daily_spent", 0.0)
             state.options_daily_spent = data.get("options_daily_spent", 0.0)
+            state.intraday_daily_spent = data.get("intraday_daily_spent", 0.0)
             state.daily_date = data.get("daily_date", "")
             state.peak_equity = data.get("peak_equity", 0.0)
             state.is_halved = data.get("is_halved", False)

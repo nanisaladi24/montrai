@@ -481,6 +481,208 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
                     f"@ net ${pick.net_limit:.2f} — risk ${pick.capital_at_risk:.0f} — {pick.reasoning}")
 
 
+def _force_top_score_paper(detector: RegimeDetector, state: BotState, regime: int,
+                            portfolio_value: float) -> bool:
+    """Paper-only safety valve. After `paper_force_after_HH:MM` ET, if no
+    option trade has fired today, open a minimum-size position on the symbol
+    with the highest |score|. Returns True if a trade was placed.
+
+    Caller is responsible for the time + enabled gate — this function just executes.
+    """
+    from executor.options_strategies import select_trade
+    from datetime import datetime as _dt
+    import pytz
+
+    regime_name = detector.regime_name(regime)
+    watchlist = get_regime_watchlist(regime)
+
+    # Find best symbol by |score|
+    best = None
+    for symbol in watchlist:
+        df = fetch_historical(symbol, days=120)
+        if df.empty or len(df) < 65:
+            continue
+        sig = swing_signal(df, symbol=symbol)
+        score = sig.get("score", 0.0)
+        if best is None or abs(score) > abs(best[1]):
+            best = (symbol, score)
+    if not best:
+        return False
+    symbol, score = best
+
+    # Force a directional pick based on score sign, bypassing normal threshold
+    # Use a tiny per-trade budget — this is observability, not conviction
+    forced_budget = min(100.0, rc.load().get("options_max_daily_usd", 1000.0))
+    # Mutate to clear threshold: the selector does its own regime filter, so
+    # we synthesize a score that clears the gate, keeping the sign of the real score.
+    signed_score = 0.99 if score >= 0 else -0.99
+    # But keep the regime filter honest — don't fire long-put in BULL etc.
+    from executor.options_strategies import _BULLISH_REGIMES, _BEARISH_REGIMES
+    if signed_score > 0 and regime_name not in _BULLISH_REGIMES:
+        return False
+    if signed_score < 0 and regime_name not in _BEARISH_REGIMES:
+        return False
+
+    pick = select_trade(symbol, signed_score, regime_name, forced_budget)
+    if pick is None:
+        logger.info(f"paper_force: no chain/strike for {symbol} (real score {score:+.2f})")
+        return False
+
+    per_contract = pick.limit_price * 100
+    qty = 1  # minimum — this is observability fire, not conviction
+    if per_contract > forced_budget:
+        logger.info(f"paper_force: {pick.contract.symbol} ${per_contract:.2f} exceeds ${forced_budget} — skip")
+        return False
+
+    order_id = buy_option(pick.contract.symbol, qty, pick.limit_price,
+                          regime_name=f"{regime_name} FORCED_PAPER")
+    if not order_id:
+        return False
+    cost = per_contract
+    state.options_daily_spent += cost
+    state.options_positions[pick.contract.symbol] = OptionsPosition(
+        contract_symbol=pick.contract.symbol,
+        underlying=pick.underlying,
+        side=pick.contract.side,
+        strike=pick.contract.strike,
+        expiry=pick.contract.expiry.isoformat() if hasattr(pick.contract.expiry, "isoformat") else str(pick.contract.expiry),
+        qty=qty, entry_premium=pick.limit_price,
+        entry_date=datetime.now(timezone.utc).date().isoformat(),
+        regime_at_entry=regime_name,
+        strategy="forced_paper",
+    )
+    state.save()
+    logger.info(f"⚠ FORCED_PAPER {pick.strategy} {pick.contract.symbol} x{qty} "
+                f"@ ${pick.limit_price:.2f} — real score {score:+.2f} on {symbol} — "
+                f"observability trade")
+    return True
+
+
+def intraday_execute_phase(detector: RegimeDetector, state: BotState, regime: int,
+                           portfolio_value: float):
+    """Opening Range Breakout strategy, filtered by HMM regime.
+
+    - Builds opening range for each watchlist symbol (first 15 min of session).
+    - After range, scans for breakouts and fires short-dated options.
+    - Flattens all intraday positions at 15:55 ET regardless of P&L.
+    """
+    from intraday.orb import (
+        compute_opening_range, detect_breakout, select_orb_trade,
+        is_range_building_window, is_range_tradeable_window, is_force_close_window,
+    )
+    from core.market_data import latest_quote
+
+    cfg = rc.load()
+    regime_name = detector.regime_name(regime)
+    opening_range_min = int(cfg.get("intraday_opening_range_min", 15))
+    fc_hour = int(cfg.get("intraday_force_close_hour_et", 15))
+    fc_min  = int(cfg.get("intraday_force_close_min_et", 55))
+
+    # ── 1. EOD force-flatten all intraday positions ────────────────────────────
+    if is_force_close_window(fc_hour, fc_min):
+        flatten_count = 0
+        for key, pos in list(state.options_positions.items()):
+            if not pos.intraday:
+                continue
+            current_premium = _fetch_option_mid(pos.contract_symbol)
+            if current_premium <= 0:
+                current_premium = max(pos.entry_premium * 0.5, 0.05)
+            limit = round(max(current_premium * 0.98, 0.05), 2)
+            order_id = sell_option(pos.contract_symbol, abs(pos.qty), limit,
+                                   reason="eod_flatten_intraday", regime_name=regime_name)
+            if order_id:
+                pnl = state.close_option_position(pos.contract_symbol, current_premium)
+                logger.info(f"INTRADAY EOD CLOSE {pos.contract_symbol} x{abs(pos.qty)} "
+                            f"@ ${current_premium:.2f} | P&L ${pnl:+.2f}")
+                flatten_count += 1
+        if flatten_count:
+            logger.info(f"Intraday EOD flatten: {flatten_count} positions closed.")
+        return
+
+    # ── 2. Skip if it's not the ORB-tradeable window ───────────────────────────
+    if is_range_building_window(opening_range_min):
+        logger.info(f"Intraday: still building opening range ({opening_range_min}min). No entries.")
+        return
+    if not is_range_tradeable_window(opening_range_min, fc_hour, fc_min):
+        return  # Outside trade window entirely
+
+    # ── 3. Exit existing intraday positions on TP/SL ───────────────────────────
+    tp = float(cfg.get("intraday_take_profit_pct", 0.40))
+    sl = float(cfg.get("intraday_stop_loss_pct", 0.30))
+    for key, pos in list(state.options_positions.items()):
+        if not pos.intraday:
+            continue
+        current_premium = _fetch_option_mid(pos.contract_symbol)
+        if current_premium <= 0:
+            continue
+        change = (current_premium - pos.entry_premium) / pos.entry_premium
+        reason = None
+        if change >= tp:
+            reason = f"intraday TP +{change:.1%}"
+        elif change <= -sl:
+            reason = f"intraday SL {change:.1%}"
+        if reason:
+            limit = round(max(current_premium * 0.98, 0.05), 2)
+            order_id = sell_option(pos.contract_symbol, abs(pos.qty), limit,
+                                   reason=reason, regime_name=regime_name)
+            if order_id:
+                pnl = state.close_option_position(pos.contract_symbol, current_premium)
+                logger.info(f"INTRADAY CLOSE {pos.contract_symbol} @ ${current_premium:.2f} | "
+                            f"P&L ${pnl:+.2f} | {reason}")
+
+    # ── 4. Scan for breakouts ──────────────────────────────────────────────────
+    max_daily = float(cfg.get("intraday_max_daily_usd", 500.0))
+    remaining = max_daily - state.intraday_daily_spent
+    if remaining <= 20:
+        return
+
+    watchlist = get_regime_watchlist(regime)
+    open_underlyings = {p.underlying for p in state.options_positions.values() if p.intraday}
+    per_trade_budget = min(remaining, remaining / max(1, 3 - len(open_underlyings)))
+
+    for symbol in watchlist:
+        if symbol in open_underlyings:
+            continue
+        or_range = compute_opening_range(symbol, opening_range_min)
+        if not or_range:
+            continue
+        spot = latest_quote(symbol)
+        if not spot:
+            continue
+        direction = detect_breakout(symbol, or_range, spot)
+        if not direction:
+            continue
+        pick = select_orb_trade(symbol, direction, regime_name, or_range, spot, per_trade_budget)
+        if not pick:
+            continue
+        if state.intraday_daily_spent + pick.total_cost > max_daily:
+            continue
+
+        order_id = buy_option(pick.contract_symbol, pick.qty, pick.limit_price,
+                              regime_name=f"{regime_name} INTRADAY_ORB")
+        if not order_id:
+            continue
+        state.intraday_daily_spent += pick.total_cost
+        state.options_positions[pick.contract_symbol] = OptionsPosition(
+            contract_symbol=pick.contract_symbol,
+            underlying=pick.underlying,
+            side="call" if pick.direction == "bullish" else "put",
+            strike=0.0,  # selector has it — not critical for intraday tracking
+            expiry="",   # filled opportunistically
+            qty=pick.qty, entry_premium=pick.limit_price,
+            entry_date=datetime.now(timezone.utc).date().isoformat(),
+            regime_at_entry=regime_name,
+            strategy="intraday_orb",
+            intraday=True,
+        )
+        state.save()
+        logger.info(f"INTRADAY OPENED {pick.contract_symbol} x{pick.qty} "
+                    f"@ ${pick.limit_price:.2f} (cost ${pick.total_cost:.0f}) — {pick.reasoning}")
+        open_underlyings.add(pick.underlying)
+        if len(open_underlyings) >= 3:
+            break
+
+
 def covered_call_phase(detector: RegimeDetector, state: BotState, regime: int, portfolio_value: float):
     """Write short calls against 100-share stock lots. Optional auto-acquire
     gated by stock_max_daily_usd cap — skips cleanly if the cap is too low."""
@@ -639,7 +841,13 @@ def main_loop():
 
     while True:
         cfg = rc.load()
-        signal_interval = cfg["signal_interval_minutes"]
+        # Intraday override — ORB strategy wants 5-min cycles during the regular
+        # session. Outside market hours the base swing interval still applies.
+        if cfg.get("intraday_enabled", False) and is_market_open():
+            signal_interval = int(cfg.get("intraday_scan_interval_min",
+                                          cfg["signal_interval_minutes"]))
+        else:
+            signal_interval = cfg["signal_interval_minutes"]
         retrain_every = max(1, int(7 * 24 * 60 / signal_interval))
         stocks_on  = cfg.get("stock_trading_enabled", False)
         options_on = cfg.get("options_trading_enabled", True)
@@ -680,6 +888,22 @@ def main_loop():
                 multi_leg_execute_phase(detector, state, regime, portfolio_value)
             if cfg.get("covered_call_enabled", False):
                 covered_call_phase(detector, state, regime, portfolio_value)
+            if cfg.get("intraday_enabled", False) and options_on:
+                intraday_execute_phase(detector, state, regime, portfolio_value)
+
+            # Paper-only safety valve — fires at end-of-session if nothing else filled
+            if (
+                cfg.get("paper_force_top_score", False)
+                and TRADING_MODE == "paper"
+                and state.options_daily_spent == 0.0
+                and state.daily_spent == 0.0
+            ):
+                import pytz as _tz
+                _et_now = datetime.now(_tz.timezone("America/New_York"))
+                force_h = int(cfg.get("paper_force_after_hour_et", 15))
+                force_m = int(cfg.get("paper_force_after_min_et", 30))
+                if (_et_now.hour, _et_now.minute) >= (force_h, force_m) and _et_now.weekday() < 5:
+                    _force_top_score_paper(detector, state, regime, portfolio_value)
 
             state.cycles += 1
             state.save()

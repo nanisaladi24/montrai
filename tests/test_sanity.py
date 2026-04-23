@@ -147,10 +147,10 @@ def test_strategy_selector_long_put_on_bearish():
 
 def test_strategy_selector_skips_weak_signals():
     from executor.options_strategies import _strategy_for
-    # Score under threshold — no trade
-    assert _strategy_for(0.40, "bull") is None
-    assert _strategy_for(-0.50, "bear") is None
-    # Conflicting direction (bullish score in bear regime) — no trade
+    # Score under the (lowered) 0.4 threshold — no trade
+    assert _strategy_for(0.30, "bull") is None
+    assert _strategy_for(-0.30, "bear") is None
+    # Conflicting direction (bullish score in crash regime) — no trade
     assert _strategy_for(0.80, "crash") is None
 
 
@@ -357,6 +357,82 @@ def test_robinhood_occ_parser():
         "strike": 150.0,
     }
     assert _parse_occ("garbage") is None
+
+
+# ── Intraday ORB + threshold knobs ────────────────────────────────────────────
+
+def test_threshold_config_exposed():
+    import config.runtime_config as rc
+    cfg = rc.load()
+    for k in ("signal_score_threshold_long", "signal_score_threshold_short",
+              "paper_force_top_score",
+              "intraday_opening_range_min", "intraday_force_close_hour_et",
+              "intraday_max_daily_usd", "intraday_target_delta",
+              "intraday_take_profit_pct", "intraday_stop_loss_pct"):
+        assert k in cfg, f"missing key {k}"
+    # Defaults: more permissive threshold + paper force OFF by default
+    assert cfg["signal_score_threshold_long"] == 0.4
+    assert cfg["signal_score_threshold_short"] == -0.4
+    assert cfg["paper_force_top_score"] is False
+
+
+def test_strategy_selector_uses_config_threshold():
+    """Lowered threshold should make score=0.45 trigger long_call in bullish regime."""
+    from executor.options_strategies import _strategy_for
+    # Score 0.45 was below old 0.6 gate; should now pass the new 0.4 default
+    assert _strategy_for(0.45, "bull") == "long_call"
+    assert _strategy_for(-0.45, "bear") == "long_put"
+    # Below threshold still rejected
+    assert _strategy_for(0.30, "bull") is None
+    assert _strategy_for(-0.30, "bear") is None
+
+
+def test_orb_time_windows():
+    """Verify ORB window logic — best checked against known fixed timestamps."""
+    from intraday.orb import is_range_building_window, is_range_tradeable_window
+    # Can't mock datetime.now cleanly without freezegun; just smoke-test imports
+    # and ensure the functions return booleans for the current wall clock.
+    assert isinstance(is_range_building_window(15), bool)
+    assert isinstance(is_range_tradeable_window(15), bool)
+
+
+def test_orb_width_filter():
+    """Tight opening range (< min_width_pct) must be rejected."""
+    from intraday.orb import OpeningRange, select_orb_trade
+    import pandas as pd
+    # Width = 0.05%, way below default 0.3% filter
+    tight = OpeningRange(
+        symbol="SPY",
+        high=710.10, low=710.00,
+        start_ts=pd.Timestamp.now(tz="UTC"),
+        end_ts=pd.Timestamp.now(tz="UTC"),
+    )
+    result = select_orb_trade("SPY", "bullish", "bull", tight,
+                              current_price=710.20, per_trade_budget_usd=500)
+    assert result is None, "Selector must skip dead-tape opening ranges"
+
+
+def test_options_position_intraday_flag_roundtrip(tmp_path, monkeypatch):
+    import config.settings as cfg
+    state_file = tmp_path / "bot_state.json"
+    monkeypatch.setattr(cfg, "STATE_FILE", str(state_file))
+    import core.position_tracker as pt
+    monkeypatch.setattr(pt, "STATE_FILE", str(state_file))
+    from core.position_tracker import BotState, OptionsPosition
+
+    state = BotState()
+    state.options_positions["O:SPY260423C00710000"] = OptionsPosition(
+        contract_symbol="O:SPY260423C00710000", underlying="SPY", side="call",
+        strike=710, expiry="2026-04-23", qty=1, entry_premium=2.5,
+        entry_date="2026-04-22", strategy="intraday_orb", intraday=True,
+    )
+    state.intraday_daily_spent = 250.0
+    state.save()
+    restored = BotState.load()
+    p = restored.options_positions["O:SPY260423C00710000"]
+    assert p.intraday is True
+    assert p.strategy == "intraday_orb"
+    assert restored.intraday_daily_spent == 250.0
 
 
 def test_spread_config_exposed():

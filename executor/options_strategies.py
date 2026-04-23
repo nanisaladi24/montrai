@@ -24,8 +24,22 @@ logger = get_logger("options_strategies")
 _BULLISH_REGIMES = {"bull", "neutral", "euphoria"}
 _BEARISH_REGIMES = {"crash", "bear", "neutral"}
 
-_MIN_SCORE_LONG = 0.6
-_MAX_SCORE_SHORT = -0.6
+# Defaults when config lookup fails — matches settings.py
+_DEFAULT_MIN_SCORE_LONG = 0.4
+_DEFAULT_MAX_SCORE_SHORT = -0.4
+
+# Legacy constants kept for tests + callers that import them directly.
+_MIN_SCORE_LONG = _DEFAULT_MIN_SCORE_LONG
+_MAX_SCORE_SHORT = _DEFAULT_MAX_SCORE_SHORT
+
+
+def _thresholds() -> tuple[float, float]:
+    """Read current long/short thresholds from runtime.json."""
+    cfg = rc.load()
+    return (
+        float(cfg.get("signal_score_threshold_long", _DEFAULT_MIN_SCORE_LONG)),
+        float(cfg.get("signal_score_threshold_short", _DEFAULT_MAX_SCORE_SHORT)),
+    )
 
 
 @dataclass
@@ -42,9 +56,10 @@ class OptionsPick:
 
 def _strategy_for(score: float, regime_name: str) -> Optional[str]:
     regime_name = (regime_name or "").lower()
-    if score >= _MIN_SCORE_LONG and regime_name in _BULLISH_REGIMES:
+    long_thr, short_thr = _thresholds()
+    if score >= long_thr and regime_name in _BULLISH_REGIMES:
         return "long_call"
-    if score <= _MAX_SCORE_SHORT and regime_name in _BEARISH_REGIMES:
+    if score <= short_thr and regime_name in _BEARISH_REGIMES:
         return "long_put"
     return None
 
@@ -128,10 +143,10 @@ def _strategy_for_spread(score: float, regime_name: str) -> Optional[str]:
     """Decision tree for vertical spreads. Credit spreads harvest IV when
     directional bias is present; debit spreads define risk for pure direction."""
     regime_name = (regime_name or "").lower()
-    # Credit structures preferred — defined risk AND IV harvest in one trade
-    if score >= _MIN_SCORE_LONG and regime_name in _BULLISH_REGIMES:
+    long_thr, short_thr = _thresholds()
+    if score >= long_thr and regime_name in _BULLISH_REGIMES:
         return "bull_put_credit"
-    if score <= _MAX_SCORE_SHORT and regime_name in _BEARISH_REGIMES:
+    if score <= short_thr and regime_name in _BEARISH_REGIMES:
         return "bear_call_credit"
     return None
 

@@ -293,8 +293,10 @@ with tab_settings:
             help="Per-day notional cap for stock buys. Can be set high; only applies when stock trading is enabled.",
         )
     with m3:
-        intraday_on = st.toggle("Intraday trading", value=bool(cfg.get("intraday_enabled", False)),
-                                help="Phase 1: flag only. Phase 2 wires Alpaca minute bars + EOD-flatten logic.")
+        intraday_on = st.toggle("Intraday (ORB)", value=bool(cfg.get("intraday_enabled", False)),
+                                help="Opening Range Breakout: builds 9:30-9:45 ET range, fires short-dated "
+                                     "options on breakouts, flattens all intraday positions at 15:55 ET. "
+                                     "Uses Polygon minute bars + HMM regime filter.")
 
     sp1, sp2, sp3 = st.columns(3)
     with sp1:
@@ -330,6 +332,57 @@ with tab_settings:
                                      value=int(cfg.get("covered_call_target_dte_min", 30)))
         cc_dte_max = st.number_input("CC DTE max", min_value=7, max_value=120, step=1,
                                      value=int(cfg.get("covered_call_target_dte_max", 45)))
+    # ── Signal Thresholds + Paper Safety Valve ─────────────────────────────────
+    st.subheader("Signal Thresholds")
+    st.caption("How aggressive the bot is about firing. Lower threshold = more trades, noisier edge.")
+    t1, t2, t3 = st.columns(3)
+    with t1:
+        long_thr = st.slider("Long threshold (score ≥)", min_value=0.1, max_value=0.9, step=0.05,
+                             value=float(cfg.get("signal_score_threshold_long", 0.4)))
+        short_thr = st.slider("Short threshold (score ≤ -)", min_value=0.1, max_value=0.9, step=0.05,
+                              value=abs(float(cfg.get("signal_score_threshold_short", -0.4))))
+    with t2:
+        force_on = st.toggle("Paper-only: force top-score if no fills by EOD",
+                             value=bool(cfg.get("paper_force_top_score", False)),
+                             help="Paper mode only. Fires ONE minimum-size position (1 contract) on the "
+                                  "symbol with the highest |score| if nothing else filled today — "
+                                  "observability, not conviction. Automatically skipped in LIVE mode.")
+    with t3:
+        force_h = st.number_input("Force after (ET hour)", min_value=9, max_value=15, step=1,
+                                  value=int(cfg.get("paper_force_after_hour_et", 15)))
+        force_m = st.number_input("Force after (ET minute)", min_value=0, max_value=59, step=5,
+                                  value=int(cfg.get("paper_force_after_min_et", 30)))
+
+    st.divider()
+
+    # ── Intraday ORB controls ──────────────────────────────────────────────────
+    st.subheader("Intraday ORB")
+    st.caption("Opening Range Breakout. Builds range, fires short-dated options on breakouts, flattens at 15:55 ET.")
+    ib1, ib2, ib3 = st.columns(3)
+    with ib1:
+        orb_window = st.number_input("Opening range (minutes)", min_value=5, max_value=60, step=5,
+                                     value=int(cfg.get("intraday_opening_range_min", 15)))
+        intraday_cap = st.number_input("Intraday daily premium cap ($)",
+                                        min_value=50.0, max_value=5000.0, step=50.0,
+                                        value=float(cfg.get("intraday_max_daily_usd", 500.0)))
+    with ib2:
+        intra_dte_min = st.number_input("DTE min", min_value=0, max_value=30, step=1,
+                                         value=int(cfg.get("intraday_target_dte_min", 1)))
+        intra_dte_max = st.number_input("DTE max", min_value=1, max_value=60, step=1,
+                                         value=int(cfg.get("intraday_target_dte_max", 7)))
+    with ib3:
+        intra_delta = st.slider("Target Δ", min_value=0.20, max_value=0.70, step=0.05,
+                                value=float(cfg.get("intraday_target_delta", 0.50)))
+        intra_min_or_width = st.slider("Min OR width (%)", min_value=0.001, max_value=0.01, step=0.001,
+                                        value=float(cfg.get("intraday_min_orb_width_pct", 0.003)))
+    ib4, ib5, _ = st.columns(3)
+    with ib4:
+        intra_tp = st.slider("Intraday TP (%)", min_value=10, max_value=100, step=5,
+                             value=int(cfg.get("intraday_take_profit_pct", 0.40) * 100))
+    with ib5:
+        intra_sl = st.slider("Intraday SL (%)", min_value=10, max_value=90, step=5,
+                             value=int(cfg.get("intraday_stop_loss_pct", 0.30) * 100))
+
     st.divider()
 
     # ── Watchlist ───────────────────────────────────────────────────────────────
@@ -499,6 +552,20 @@ with tab_settings:
             "spread_wing_width":         float(sp_width),
             "iron_condor_short_delta":   float(ic_delta),
             "iron_condor_wing_width":    float(ic_width),
+            "signal_score_threshold_long":  float(long_thr),
+            "signal_score_threshold_short": -float(short_thr),
+            "paper_force_top_score":     bool(force_on),
+            "paper_force_after_hour_et": int(force_h),
+            "paper_force_after_min_et":  int(force_m),
+            "intraday_enabled":          bool(intraday_on),
+            "intraday_opening_range_min": int(orb_window),
+            "intraday_max_daily_usd":    float(intraday_cap),
+            "intraday_target_dte_min":   int(intra_dte_min),
+            "intraday_target_dte_max":   int(intra_dte_max),
+            "intraday_target_delta":     float(intra_delta),
+            "intraday_min_orb_width_pct": float(intra_min_or_width),
+            "intraday_take_profit_pct":  intra_tp / 100,
+            "intraday_stop_loss_pct":    intra_sl / 100,
         })
         rc.save(cfg)
         st.success("Settings saved. Bot will pick them up on the next cycle.")

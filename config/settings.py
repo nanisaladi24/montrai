@@ -31,6 +31,31 @@ OPTIONS_MIN_DTE_EXIT    = 7          # Close when days-to-expiry drops below thi
 OPTIONS_TARGET_DTE      = (30, 45)   # Preferred expiry window at entry
 OPTIONS_TARGET_DELTA    = 0.40       # Target absolute delta for long-call/long-put strike
 
+# ── Signal Thresholds ─────────────────────────────────────────────────────────
+# Score gates for entry. Dropped from ±0.6 to ±0.4 for more firing opportunity;
+# still filtered, just less strict. Raise back to 0.6 for conservative mode.
+SIGNAL_SCORE_THRESHOLD_LONG  =  0.4
+SIGNAL_SCORE_THRESHOLD_SHORT = -0.4
+
+# Paper-only safety valve: if no trade has fired all day by 15:30 ET, open a
+# minimum-size position on the top-|score| symbol so the execution pipeline is
+# actually exercised. Skipped automatically in live mode.
+PAPER_FORCE_TOP_SCORE = False
+PAPER_FORCE_AFTER_HOUR_ET = 15       # Hour (ET) after which the force path activates
+PAPER_FORCE_AFTER_MIN_ET  = 30
+
+# ── Intraday (Opening Range Breakout) ─────────────────────────────────────────
+INTRADAY_OPENING_RANGE_MIN    = 15   # Define range from 9:30-9:45 ET
+INTRADAY_FORCE_CLOSE_HOUR_ET  = 15   # Flatten intraday books at 15:55 ET
+INTRADAY_FORCE_CLOSE_MIN_ET   = 55
+INTRADAY_SCAN_INTERVAL_MIN    = 5    # Override swing's 30-min cycle when intraday on
+INTRADAY_MAX_DAILY_USD        = 500.0
+INTRADAY_TARGET_DTE           = (1, 7)    # Short-dated options; high gamma per dollar
+INTRADAY_TARGET_DELTA         = 0.50      # ATM-ish for fast move capture
+INTRADAY_STOP_LOSS_PCT        = 0.30      # Tighter stops than swing — no room for reversal
+INTRADAY_TAKE_PROFIT_PCT      = 0.40
+INTRADAY_MIN_ORB_WIDTH_PCT    = 0.003     # 0.3% minimum opening-range width (skip dead tape)
+
 # ── Multi-leg Spreads + Iron Condor ────────────────────────────────────────────
 # Phase 2: defined-risk vertical spreads and iron condors. Off by default —
 # flip via runtime.json or dashboard to activate.
