@@ -1,112 +1,102 @@
 # Data Sources — Montrai
 
-A reference for every data feed Montrai uses or can use, with cost, what it unlocks, and setup instructions.
+Reference for every feed Montrai uses, where it routes to, and what it costs.
+
+Data architecture is **tiered with graceful fallback** — each fetcher tries the primary source first and falls back silently if it fails. You only need the Alpaca key to run the bot; everything else improves signal quality but isn't blocking.
 
 ---
 
-## Currently Active (Free)
+## Required
 
-All sourced via **yfinance** — no API key needed.
-
-| Signal | Ticker | What it tells the HMM |
-|---|---|---|
-| SPY returns + technicals | `SPY` | Core market direction |
-| VIX | `^VIX` | Fear gauge |
-| VIX 3-month | `^VIX3M` | VIX term structure |
-| VVIX | `^VVIX` | Vol-of-vol: early warning before VIX spikes |
-| TLT | `TLT` | Bond market / flight-to-safety |
-| DXY | `DX-Y.NYB` | US dollar strength / liquidity tightening |
-| HYG | `HYG` | High-yield credit / risk appetite |
-| SMH | `SMH` | Semiconductor sector leadership |
+### Alpaca
+- **What it's used for:** Options chain + Greeks + IV, order execution (both paper and live), equity quotes
+- **Cost:** Free for paper + market data (with broker-only tier)
+- **Sign up:** https://alpaca.markets
+- **Keys:** `ALPACA_API_KEY`, `ALPACA_SECRET_KEY` in `.env`
+- **Without it:** Bot won't start. No options data, no execution.
 
 ---
 
-## Free — Just Needs API Key
+## Recommended (free tiers work)
+
+### financial-datasets.ai
+- **What it's used for:** Equity + ETF daily OHLCV (replaces yfinance for SEC-tickered securities), fundamentals (P/E, earnings, insider trades), news
+- **Cost:** Free tier with 250 req/month, paid plans available
+- **Sign up:** https://financialdatasets.ai
+- **Key:** `FINANCIAL_DATASETS_API_KEY` in `.env`
+- **Impact:** Cleaner equity data than yfinance, plus a fundamental overlay blended 30% into the swing signal (valuation, earnings beats, insider activity).
+
+### Polygon / massive.com
+- **What it's used for:**
+  - VIX / VVIX / VIX3M index daily closes (for HMM macro features)
+  - Stock + ETF daily + intraday minute bars
+  - Options contract aggregates + chain history
+  - Latest trade quotes
+- **Cost:** Varies by tier. Many endpoints available on free or entry-level tiers; some (full-market snapshot, indices aggregates, S3 flat files) are gated to higher tiers.
+- **Sign up:** https://massive.com
+- **Key:** `POLYGON_API_KEY` in `.env`
+- **Tier-gated endpoints that may return NOT_AUTHORIZED on your plan:**
+  - `/v2/snapshot/locale/us/markets/stocks/gainers` and `/losers`
+  - `/v2/snapshot/locale/us/markets/stocks/tickers` (full-market snapshot)
+  - `/v2/aggs/ticker/I:VIX/range/...` (index aggregates)
+  - S3 flat-file downloads
+- **Fallback:** Bot falls back to Alpaca screener (for movers) and yfinance (for indices) silently. Existing functionality continues.
+- **S3 flat files** (if included in your plan): historical options chains + minute bars going back years. Use `scripts/polygon_s3_sync.py` to pull locally and `core/polygon_s3.py` to read.
 
 ### FRED (Federal Reserve Economic Data)
-- **Cost:** Free
+- **What it's used for:** Yield curve spread (10Y-2Y), Fed Funds rate, HY credit spread — all three fed into the HMM as macro features
+- **Cost:** Free, unlimited
 - **Sign up:** https://fred.stlouisfed.org/docs/api/api_key.html
-- **What it unlocks:**
-  - Yield curve (10Y–2Y spread) — the best recession predictor
-  - Fed Funds rate — context for rate-sensitive regimes
-  - Credit spreads (IG and HY OAS)
-- **Set in dashboard:** Data Sources → FRED API Key
-- **Impact:** High. Yield curve inversion historically precedes bear regimes by 6–18 months.
+- **Key:** Set in dashboard → Data Sources tab, stored in `config/runtime.json` as `data_sources.fred_api_key`
+- **Impact:** High. Yield curve inversion is historically the cleanest recession predictor.
 
 ---
 
-## Paid — Recommended
+## Fallback (no key required)
 
-### Polygon.io
-- **Cost:** Free tier (delayed data) | $29/mo (real-time) | $79/mo (options)
-- **Sign up:** https://polygon.io/
-- **What it unlocks:**
-  - Real-time quotes (vs yfinance's 15-min delay on some feeds)
-  - Options chain data (volume, OI, IV by strike)
-  - Tick-level trade data for intraday strategies
-- **Set in dashboard:** Data Sources → Polygon API Key
-- **Impact:** Medium now (swing trading tolerates 15-min delay). High when adding intraday or options strategies.
-
-### SpotGamma
-- **Cost:** ~$50/mo (Founder tier) | ~$110/mo (Pro)
-- **Sign up:** https://spotgamma.com/
-- **API:** None — SpotGamma is a web UI only, no public API.
-- **Status:** GEX is **already calculated internally** in Montrai using the SPY options chain + Black-Scholes. `gex_per_spot` and `gamma_flip_dist` are always-active HMM features, no subscription needed.
-  - Positive GEX → dealers long gamma → price mean-reverts (chop)
-  - Negative GEX → dealers short gamma → moves get amplified (trending)
-  - `gamma_flip_dist` — how far spot is from the zero-gamma level
-- **Use SpotGamma for:** Visual cross-checking your bot's GEX readings. Their charts are excellent for manual review.
-- **Impact:** Already captured — no action needed.
-
-### Unusual Whales
-- **Cost:** ~$50/mo
-- **Sign up:** https://unusualwhales.com/
-- **What it unlocks:**
-  - Options flow: large unusual options bets (often precede moves by 1–3 days)
-  - Dark pool prints: large institutional block trades
-  - Congress/Senate trading disclosures
-- **Set in dashboard:** Data Sources → Unusual Whales API Key
-- **Impact:** Medium-High for individual stock signals. Best combined with existing swing signal scorer.
-
-### Nasdaq Data Link (formerly Quandl)
-- **Cost:** Free tier available | paid bundles vary ($50–$500+/mo)
-- **Sign up:** https://data.nasdaq.com/
-- **What it unlocks:**
-  - Short interest data (days to cover, short float %)
-  - Institutional ownership changes (13F filings, aggregated)
-  - COT (Commitment of Traders) reports for futures positioning
-- **Set in dashboard:** Data Sources → Nasdaq Data Link API Key
-- **Impact:** Medium. Short interest is a useful contrarian signal; COT data is valuable for macro regime context.
+### yfinance
+- **What it's used for:** Last-resort fallback for:
+  - DXY (`DX-Y.NYB` — ICE futures, not available on financial-datasets or Polygon index aggregates on most tiers)
+  - VIX / VVIX / VIX3M when Polygon indices return NOT_AUTHORIZED
+  - Any SEC ticker when financial-datasets fails
+- **Cost:** Free (unofficial Yahoo scraping)
+- **Impact:** Nothing to configure. Fallbacks run automatically.
+- **Warning:** yfinance is unofficial — breaks occasionally when Yahoo changes their internal API.
 
 ---
 
-## Not Recommended (Yet)
+## HMM feature matrix (always 21 columns)
 
-| Source | Reason to skip for now |
+Stable schema — missing sources zero-fill rather than shrinking the column count. Prevents force-retrains on transient API outages.
+
+| Feature | Source |
 |---|---|
-| **TradingView** | Charts and alerts only — no programmatic API for data ingestion |
-| **Bloomberg Terminal** | $25K+/yr — overkill until this is institutional-scale |
-| **Refinitiv/LSEG** | Same as Bloomberg at similar cost |
-| **$TICK / $ADD / $TRIN** | Intraday breadth only — not available on daily bars via any free/cheap feed |
+| `ret_1d`, `ret_5d`, `ret_20d`, `ret_60d` | SPY OHLC (financial-datasets → yfinance) |
+| `realised_vol`, `atr_pct`, `bb_position`, `vol_ratio` | Computed from SPY OHLC |
+| `vix_rank`, `vix_term_ratio` | VIX + VIX3M (Polygon → yfinance) |
+| `vvix_rank`, `vvix_vix_ratio` | VVIX + VIX (Polygon → yfinance) |
+| `tlt_ret`, `hyg_ret`, `smh_spy_rs` | TLT / HYG / SMH ETFs (financial-datasets) |
+| `dxy_ret` | DXY (yfinance only) |
+| `yield_curve_spread`, `fed_funds_rate`, `hy_credit_spread` | FRED |
+| `gex_per_spot`, `gamma_flip_dist` | Alpaca options chain (Black-Scholes computed locally) |
 
 ---
 
-## Priority Order (Suggested Upgrade Path)
+## Why not Bloomberg / Refinitiv / LSEG?
 
-1. **FRED** — Free, done. Yield curve, fed funds rate, credit spread active.
-2. **SpotGamma** — No API needed. GEX already calculated internally from yfinance options chain.
-3. **Unusual Whales** — $50/mo. Add once the bot is consistently profitable in paper.
-4. **Polygon.io** — $29–79/mo. Prioritize when adding intraday or options strategies.
-5. **Nasdaq Data Link** — Add when short interest or COT signals are needed.
+$20K–$30K per year per seat. Not remotely appropriate for a personal or small-scale trading operation. What they offer beyond the stack above:
+- Intraday order book depth (Level 2 / Level 3)
+- OTC derivatives and fixed-income data
+- Research feeds with institutional coverage
+
+None of which unlocks additional edge for equity options day-trading.
 
 ---
 
-## Feature Unlock Summary
+## Priority order for new users
 
-| Key configured | New HMM features unlocked |
-|---|---|
-| FRED | `yield_curve_spread`, `fed_funds_rate`, `hy_credit_spread` |
-| Polygon | Higher-quality real-time quotes (replaces yfinance for live signals) |
-| SpotGamma | `gex_level`, `gamma_flip_distance` |
-| Unusual Whales | `options_flow_score` per symbol |
-| Nasdaq Data Link | `short_interest_ratio`, `cot_net_positioning` |
+1. **Alpaca** — required. Sign up, paper account, copy keys to `.env`.
+2. **financial-datasets** — free tier is enough for the fundamental overlay. Sign up, add key.
+3. **FRED** — free and fast to set up. Add key via dashboard.
+4. **Polygon / massive.com** — most valuable for intraday and options history. Free tier covers the basics; upgrade when you need more data.
+5. Everything else is optional.

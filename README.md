@@ -1,237 +1,209 @@
 # Montrai — AI Trading Platform
 
-> *An intelligent, regime-aware trading platform built for scale.*
+> *A regime-aware, options-primary trading bot that reads the market like a trained mind and executes with defined-risk discipline.*
 
-Montrai is a modular AI trading platform that starts with automated swing trading and is designed to grow into a full-spectrum trading ecosystem — spanning multiple strategies, asset classes, risk tiers, and eventually a multi-user SaaS product.
+Montrai is a modular trading platform that detects market regimes with Hidden Markov Models, scans a daily-refreshed watchlist for setups, and executes a multi-strategy options book — all while enforcing hard-coded circuit breakers that can't be overridden by signal logic.
 
-The name **Montrai** reflects the vision: a system that reads the market like a trained mind and executes with precision.
+## What it does (today)
 
----
+- **HMM regime detection** on SPY — classifies the market as crash / bear / neutral / bull / euphoria using 21 features across price, volatility, macro (yield curve, VIX term structure), and options positioning (GEX). Retrains weekly.
+- **Options-primary execution**:
+  - Long calls + long puts (directional, defined risk = premium paid)
+  - Vertical credit spreads (bull put credit, bear call credit — harvest IV with capped downside)
+  - Iron condor (neutral regime — collect premium on chop)
+  - Covered calls (write short calls against held stock)
+  - Opening Range Breakout intraday (short-dated ATM options on first-hour breakouts)
+  - Paper-only safety valve: forced-top-score fire if no trades fill by EOD (observability, not conviction)
+- **Dynamic daily watchlist** — pre-market each day, merges top gainers + losers + most-actives from Alpaca's screener on top of a static base. Filters penny stocks, warrants, and anything with thin ATM options. Defensive regimes (bear/euphoria) narrow to blue chips only.
+- **Dual broker support** — Alpaca (paper + live) or Robinhood (live only via community SDK).
+- **Real-time dashboard** — Streamlit at `localhost:8501`, paper/live banner always visible, bot status pill (Running/Sleeping/Stopped/Lockout), open positions by asset class, dynamic watchlist, every strategy knob as a toggle.
+- **Full test suite** — 52 unit tests covering risk math, signed-qty spread P&L, direction-aware exits, HMM schema stability, and broker OCC-symbol parsing.
 
-## Current State: Swing Trader (v0.1)
+## Safety first — circuit breakers
 
-The first module is a fully automated swing trading engine connected to Robinhood. It detects market regimes using Hidden Markov Models, sizes positions dynamically, and protects capital through hard-coded circuit breakers.
-
-### What it does today
-- Detects market regimes (crash / bear / neutral / bull / euphoria) using a HMM trained on SPY
-- Scans a configurable watchlist for swing trade setups (RSI, MACD, Bollinger Bands, ATR)
-- Executes fractional orders via the Robinhood API
-- Enforces strict safety rules independently of AI signal logic
-- Walk-forward backtests strategies without look-ahead bias
-- Visualizes everything in a live Streamlit dashboard
-
----
-
-## Safety & Circuit Breakers
-
-These are hard-coded in `risk/risk_manager.py` and cannot be overridden by any AI signal or strategy layer.
+Hard-coded in `risk/risk_manager.py`. Cannot be disabled by AI signal, strategy, or dashboard toggle.
 
 | Circuit Breaker | Trigger | Effect |
 |---|---|---|
-| Daily spend cap | Cumulative buys exceed **$500/day** | Trade blocked or trimmed |
-| Daily loss halt | Portfolio drops **2%** from day open | Position sizes halved for remainder of day |
-| Peak drawdown lockout | Portfolio drops **10%** from all-time high | Creates `LOCKOUT` file, bot exits, requires manual restart |
-| Per-position stop-loss | Price falls **5%** from entry | Position closed immediately |
-| Per-position take-profit | Price rises **12%** from entry | Position closed, gains locked |
+| Options daily cap | Premium outlay exceeds **$1,000/day** | Trade blocked or trimmed |
+| Stock daily cap | Notional exceeds **$5,000/day** | Trade blocked or trimmed |
+| Intraday daily cap | Premium exceeds **$500/day** | Separate from swing cap |
+| Daily loss halt | Portfolio drops **2%** from day open | Position sizes halved rest of day |
+| Peak drawdown lockout | Portfolio drops **10%** from all-time high | Writes `LOCKOUT` file, bot exits, manual restart |
+| Per-option stops | Premium ±50% (long) / premium doubled (short credit) | Position closed |
+| Intraday force flatten | **15:55 ET** daily | All intraday positions closed regardless of P&L |
 
-**To restart after a drawdown lockout:** investigate the cause, then `rm LOCKOUT` before restarting.
-
----
-
-## Project Structure
+## Architecture
 
 ```
 montrai/
 ├── config/
-│   └── settings.py          # All tunable constants — start here
+│   ├── settings.py              # Static defaults — hard-coded safety limits live here
+│   ├── runtime_config.py         # Hot-reloadable overrides (no restart needed)
+│   └── runtime.json              # Actual runtime values (gitignored — your knobs)
 ├── core/
-│   ├── market_data.py        # Historical + live price feeds (yfinance)
-│   ├── feature_engineering.py # Technical indicators + swing signal scorer
-│   └── position_tracker.py  # Persistent state: positions, daily counters, P&L
+│   ├── market_data.py            # OHLCV + quotes (financial-datasets primary, yfinance fallback)
+│   ├── feature_engineering.py    # 21-col HMM feature matrix + swing signal scorer
+│   ├── options_data.py           # Alpaca options chain, pick_contract / pick_vertical_spread / pick_iron_condor
+│   ├── polygon_client.py         # Polygon REST (indices, intraday bars, options history)
+│   ├── financial_datasets.py     # Fundamentals + daily OHLCV via financialdatasets.ai
+│   └── position_tracker.py       # BotState (Positions + OptionsPositions + MultiLegPositions)
 ├── regime/
-│   ├── hmm_engine.py         # HMM: trains on SPY, auto-selects 3–7 regimes
-│   └── strategies.py         # Regime → allocation multiplier + watchlist mapping
+│   ├── hmm_engine.py             # Gaussian HMM on SPY, 3–7 regimes, BIC selection, stability filter
+│   └── strategies.py             # Regime → allocation multiplier + watchlist narrowing
 ├── risk/
-│   └── risk_manager.py       # Circuit breakers (stateless, regime-independent)
+│   └── risk_manager.py           # All circuit breakers + direction-aware exits
 ├── executor/
-│   └── order_executor.py     # Robinhood API wrapper (paper + live modes)
+│   ├── base.py                   # Abstract broker interface
+│   ├── alpaca_broker.py          # Alpaca: stocks, options, multi-leg (MLEG)
+│   ├── robinhood_broker.py       # Robinhood via robin_stocks (live only, community SDK)
+│   ├── options_strategies.py     # Decision tree: regime × score → long / spread / condor pick
+│   └── order_executor.py         # Public facade — never import broker impls directly
+├── intraday/
+│   └── orb.py                    # Opening Range Breakout strategy (1-7 DTE options)
+├── discovery/
+│   └── dynamic_watchlist.py      # Pre-market mover + most-actives discovery with liquidity filter
 ├── backtester/
-│   └── walk_forward.py       # Walk-forward engine with rolling train/test windows
+│   └── walk_forward.py           # Walk-forward train/test, no look-ahead bias
 ├── dashboard/
-│   └── app.py                # Streamlit real-time dashboard
-├── monitoring/
-│   └── logger.py             # Structured logging + trade CSV
-├── tests/
-│   ├── test_risk_manager.py
-│   ├── test_feature_engineering.py
-│   └── test_position_tracker.py
-├── main.py                   # Orchestrator: Train → Monitor → Execute loop
-├── requirements.txt
-└── .env.example
+│   └── app.py                    # Streamlit — 4 tabs (Live / Options / Settings / Data Sources)
+├── scripts/
+│   └── polygon_s3_sync.py        # Polygon S3 flat-file ingester (if plan tier includes it)
+├── tests/                        # 52 tests, pytest, 1.1s
+├── main.py                       # Train → Monitor → Execute orchestrator
+└── requirements.txt
 ```
 
----
+## Quickstart (for anyone cloning)
 
-## Quick Start
+### 1. Prerequisites
+- Python 3.12+
+- An Alpaca account (free paper at https://alpaca.markets) — required for options chain data even if you plan to trade elsewhere
+- Optional: Polygon / massive.com, financial-datasets, FRED keys for fuller data stack
 
-### 1. Install
-
+### 2. Install
 ```bash
+git clone https://github.com/nanisaladi24/montrai.git
 cd montrai
 python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt
 ```
 
-### 2. Configure
-
+### 3. Configure
 ```bash
 cp .env.example .env
+# Edit .env — at minimum set ALPACA_API_KEY + ALPACA_SECRET_KEY (paper keys)
 ```
 
-Edit `.env`:
+Minimum `.env`:
 ```
-ROBINHOOD_USERNAME=your_email@example.com
-ROBINHOOD_PASSWORD=your_password
-TRADING_MODE=paper        # keep this as paper until you're confident
+BROKER=alpaca
+TRADING_MODE=paper
+ALPACA_API_KEY=PK...
+ALPACA_SECRET_KEY=...
+ALPACA_PAPER=true
 ```
 
-### 3. Run a backtest
+Full recommended `.env` also sets `FINANCIAL_DATASETS_API_KEY`, `POLYGON_API_KEY`, and the FRED key (via dashboard or `config/runtime.json`).
 
-Always backtest before running live.
-
+### 4. Run tests
 ```bash
-python main.py --backtest --symbol AAPL
-python main.py --backtest --symbol SPY
+.venv/bin/python -m pytest tests/ -v
 ```
+Expect 52/52 green in ~1 second.
 
-The walk-forward engine trains on rolling 252-day windows and tests on the following 63 days. No look-ahead bias.
-
-### 4. Launch the dashboard
-
+### 5. Start bot + dashboard (separate terminals)
 ```bash
-streamlit run dashboard/app.py
+# Terminal A — trading bot
+.venv/bin/python main.py
+
+# Terminal B — dashboard
+STREAMLIT_BROWSER_GATHER_USAGE_STATS=false \
+  .venv/bin/streamlit run dashboard/app.py --server.port 8501
 ```
 
-Opens at `http://localhost:8501`. Shows open positions, circuit breaker status, trade history, and regime legend.
+Dashboard: http://localhost:8501 — big banner confirms 📄 PAPER or 🚨 LIVE.
 
-### 5. Start the bot (paper mode)
+### 6. Enable strategies (from dashboard Settings tab)
 
-```bash
-python main.py
-```
+Everything is OFF by default. Flip toggles when ready:
 
-The bot runs an hourly cycle: detect regime → scan for exits → scan for entries. It retrains the HMM every 7 days automatically.
+- `options_trading_enabled` (on by default) — long calls / long puts
+- `intraday_enabled` — Opening Range Breakout (minute-bar cycles during market hours)
+- `spreads_enabled` — vertical credit spreads
+- `iron_condor_enabled` — neutral-regime iron condors
+- `covered_call_enabled` — write calls against held shares
+- `stock_trading_enabled` (off by default) — swing stock trades
+- `paper_force_top_score` — paper-only EOD observability fire
 
-### 6. Go live (when ready)
+See [`RUN.md`](RUN.md) for day-to-day operating instructions.
 
-Set `TRADING_MODE=live` in `.env`. Run in paper mode for **at least one month** first.
+## Data stack
 
----
-
-## Regime System
-
-The HMM is trained on SPY's daily returns, realized volatility, ATR, Bollinger Band position, and volume ratio. It auto-selects the optimal number of regimes (3–7) using BIC scoring, and a stability filter requires N consecutive bars in the same regime before a flip is confirmed.
-
-| Regime | Name | Allocation Multiplier | Behavior |
-|---|---|---|---|
-| 0 | Crash | 0.0 | No new trades |
-| 1 | Bear | 0.3 | Defensive only (index ETFs, financials) |
-| 2 | Neutral | 0.6 | Quality large-caps |
-| 3 | Bull | 1.0 | Full universe, full size |
-| 4 | Euphoria | 0.7 | Trim back (overheated market) |
-
----
-
-## Configuration Reference
-
-All settings live in `config/settings.py`. Key ones:
-
-| Setting | Default | Description |
+| Source | Used for | Status |
 |---|---|---|
-| `MAX_DAILY_SPEND_USD` | `500.0` | Hard cap on buy-side dollars per day |
-| `MAX_POSITION_SIZE_PCT` | `0.15` | Max 15% of portfolio per position |
-| `MAX_OPEN_POSITIONS` | `8` | Max concurrent swing trades |
-| `STOP_LOSS_PCT` | `0.05` | 5% hard stop per position |
-| `TAKE_PROFIT_PCT` | `0.12` | 12% take-profit target |
-| `DAILY_LOSS_HALT_PCT` | `0.02` | 2% daily loss triggers size halving |
-| `PEAK_DRAWDOWN_LOCKOUT_PCT` | `0.10` | 10% drawdown from peak → full lockout |
-| `MIN_HOLD_DAYS` / `MAX_HOLD_DAYS` | `2` / `14` | Swing trade holding window |
-| `WATCHLIST` | 13 symbols | Universe of tradeable instruments |
+| **Alpaca** | Options chain + Greeks + execution | Required |
+| **financial-datasets** | Equity/ETF OHLCV + fundamentals | Recommended (has free tier) |
+| **Polygon / massive.com** | VIX/VVIX indices, intraday minute bars, options history | Recommended (has free tier) |
+| **FRED** | Yield curve, fed funds, HY credit spread | Recommended (free) |
+| **yfinance** | Fallback for indices + DXY | Always on (no key needed) |
 
----
+See [`DATA_SOURCES.md`](DATA_SOURCES.md) for signup links, costs, and what each source unlocks.
 
-## Running Tests
+## Strategy decision tree
 
-```bash
-python -m pytest tests/ -v
+```
+Score / regime / score_magnitude
+  ├─ BULLISH regime (bull / neutral / euphoria):
+  │    ├─ score ≥ +0.6    → long_call (if spreads off) OR bull_put_credit (if spreads on)
+  │    └─ +0.4 ≤ score < +0.6 → long_call (threshold-gated)
+  ├─ BEARISH regime (crash / bear / neutral):
+  │    ├─ score ≤ −0.6    → long_put (if spreads off) OR bear_call_credit (if spreads on)
+  │    └─ −0.6 < score ≤ −0.4 → long_put (threshold-gated)
+  ├─ NEUTRAL + |score| < 0.3 + iron_condor_enabled → iron_condor
+  └─ Nothing above fires → wait
 ```
 
-All 15 tests cover risk manager circuit breakers, feature engineering outputs, and position tracker state management.
+Regime allocation multiplier: crash 0× (no trades), bear 0.3×, neutral 0.6×, bull 1.0×, euphoria 0.7×.
 
----
+## Tests
+
+```bash
+.venv/bin/python -m pytest tests/ -q
+# 52 passed in 1.14s
+```
+
+Coverage highlights:
+- Signed-qty math for long + short options (debit + credit spreads)
+- Direction-aware exit rules (credit TP at 50% decay; debit TP at +50% on debit)
+- Iron condor position math (width, max profit, max loss)
+- HMM schema stability (21 cols always, even when FRED/GEX fail)
+- BotState JSON roundtrip with all position types
+- Dynamic watchlist filtering (rejects penny stocks, warrants, dedups sources)
 
 ## Roadmap
 
-Montrai is version 0.1. Below is the intended expansion path toward a full AI trading platform.
+- [x] HMM regime detection (21 features, BIC-selected 3-7 regimes)
+- [x] Options-primary execution on Alpaca + Robinhood
+- [x] Multi-leg spreads (credit + debit) + iron condor
+- [x] Covered calls with strict cap enforcement
+- [x] Opening Range Breakout intraday (1-7 DTE, HMM-filtered)
+- [x] Dynamic daily watchlist (movers + most-actives, liquidity-filtered)
+- [x] Paper/live mode banner + bot heartbeat
+- [x] Full test suite (52 tests)
+- [ ] Historical options backtesting (Polygon S3 flat files — gated by plan tier)
+- [ ] Sector rotation + pairs trading strategies
+- [ ] Reinforcement learning for position sizing
+- [ ] WebSocket streaming for sub-minute intraday reactions
+- [ ] REST API + web UI (multi-user SaaS direction)
 
-### Phase 1 — Swing Trader (current)
-- [x] HMM regime detection
-- [x] Swing trade signal engine (RSI, MACD, BB, ATR)
-- [x] Robinhood execution + paper mode
-- [x] Circuit breakers + daily spend cap
-- [x] Walk-forward backtester
-- [x] Streamlit dashboard
-- [ ] Email/webhook alerts on trades and circuit breaker triggers
-- [ ] Multi-symbol backtesting with portfolio-level metrics (Sharpe, max drawdown)
-- [ ] Trailing stop-loss implementation
+## Design principles
 
-### Phase 2 — Strategy Layer Expansion
-- [ ] Momentum strategy module (trend-following, moving average crossovers)
-- [ ] Mean reversion module (pairs trading, statistical arbitrage)
-- [ ] Options strategy layer (covered calls, cash-secured puts for income)
-- [ ] Crypto module (BTC, ETH, SOL via Robinhood crypto)
-- [ ] Strategy selector: let the regime dictate which strategy module is active
-
-### Phase 3 — Intelligence Upgrades
-- [ ] LLM-powered news sentiment scoring per symbol (earnings, macro events)
-- [ ] Earnings calendar awareness (avoid holding through earnings by default)
-- [ ] Alternative data feeds (options flow, short interest, institutional filings)
-- [ ] Reinforcement learning policy for position sizing (replace Kelly approximation)
-- [ ] Self-evaluation: bot reviews its own closed trades and updates confidence priors
-
-### Phase 4 — Infrastructure & Reliability
-- [ ] Multi-broker support (Alpaca, Interactive Brokers, Schwab)
-- [ ] PostgreSQL trade ledger (replace CSV)
-- [ ] Scheduled retraining pipeline (cron or cloud task)
-- [ ] Real-time WebSocket data feeds for intraday strategies
-- [ ] Docker containerization + deployment to cloud (AWS/GCP)
-- [ ] Monitoring and alerting via Grafana + PagerDuty
-
-### Phase 5 — Platform (Open Source or SaaS)
-- [ ] REST API layer exposing signals, positions, and performance metrics
-- [ ] User authentication + per-user portfolio isolation
-- [ ] Strategy marketplace: plug-in custom strategy modules
-- [ ] Backtesting-as-a-service endpoint
-- [ ] Web UI (React/Next.js) replacing Streamlit dashboard
-- [ ] Subscription tiers: free (paper only), pro (live trading), enterprise (custom strategies)
-- [ ] Open-source core with premium strategy modules
-
----
-
-## Design Principles
-
-**Safety first.** Circuit breakers are stateless, hard-coded, and run before every trade decision. They can never be disabled by strategy or AI logic.
-
-**Modular by design.** Each layer (data, signals, regime, risk, execution) is independent. Swapping brokers or strategies does not require touching other modules.
-
-**No look-ahead bias.** The backtester trains only on data available at decision time. Walk-forward validation is the minimum bar; any new strategy must pass it.
-
-**Paper before live.** The default mode is paper trading. Going live is an intentional, explicit act.
-
-**Audit trail always.** Every trade, every circuit breaker trigger, every regime change is logged. `logs/` and `logs/trades.csv` are the source of truth.
-
----
+- **Safety first.** Circuit breakers are stateless, hard-coded, and evaluated before every trade decision.
+- **Modular by design.** Brokers, strategies, data sources are independent. Swapping one doesn't require touching others.
+- **No look-ahead bias.** Backtester trains only on data available at decision time.
+- **Paper before live.** Default mode is paper. Going live is an intentional env-variable flip with a red banner warning.
+- **Audit trail always.** Every trade, circuit breaker trigger, and regime change is logged. `logs/` + `logs/trades.csv` are source of truth.
 
 ## License
 
