@@ -184,6 +184,9 @@ class BotState:
     total_realized_pnl: float = 0.0
     options_realized_pnl: float = 0.0
     cycles: int = 0                 # Number of completed main-loop iterations
+    # Dynamic watchlist — pre-market discovered movers, refreshed once per day
+    dynamic_watchlist: list = field(default_factory=list)   # list[dict{symbol, source, price, percent_change}]
+    dynamic_watchlist_date: str = ""
 
     def reset_daily_if_new_day(self):
         today = date.today().isoformat()
@@ -209,6 +212,8 @@ class BotState:
             "total_realized_pnl": self.total_realized_pnl,
             "options_realized_pnl": self.options_realized_pnl,
             "cycles": self.cycles,
+            "dynamic_watchlist": self.dynamic_watchlist,
+            "dynamic_watchlist_date": self.dynamic_watchlist_date,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -230,6 +235,8 @@ class BotState:
             state.total_realized_pnl = data.get("total_realized_pnl", 0.0)
             state.options_realized_pnl = data.get("options_realized_pnl", 0.0)
             state.cycles = data.get("cycles", 0)
+            state.dynamic_watchlist = data.get("dynamic_watchlist", []) or []
+            state.dynamic_watchlist_date = data.get("dynamic_watchlist_date", "")
             for sym, pdata in data.get("positions", {}).items():
                 state.positions[sym] = Position(**pdata)
             for key, odata in data.get("options_positions", {}).items():

@@ -481,6 +481,54 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
                     f"@ net ${pick.net_limit:.2f} — risk ${pick.capital_at_risk:.0f} — {pick.reasoning}")
 
 
+def refresh_dynamic_watchlist(state: BotState, force: bool = False) -> bool:
+    """Refresh today's dynamic watchlist once per day (pre-market).
+
+    Returns True if a refresh was performed. Skips when:
+      - already refreshed today (unless force=True)
+      - dynamic_watchlist_enabled is False
+    """
+    cfg = rc.load()
+    if not cfg.get("dynamic_watchlist_enabled", True):
+        return False
+
+    from datetime import date as _d
+    today = _d.today().isoformat()
+    if state.dynamic_watchlist_date == today and not force:
+        return False
+
+    try:
+        from discovery.dynamic_watchlist import build_daily_watchlist
+    except Exception as e:
+        logger.warning(f"dynamic watchlist import failed: {e}")
+        return False
+
+    base = rc.get_watchlist()
+    limit     = int(cfg.get("dynamic_watchlist_limit", 20))
+    min_price = float(cfg.get("dynamic_watchlist_min_price", 5.0))
+    min_oi    = int(cfg.get("dynamic_watchlist_min_oi", 500))
+
+    logger.info(f"═══ DYNAMIC WATCHLIST REFRESH ═══ (limit={limit}, min_price=${min_price}, min_oi={min_oi})")
+    try:
+        picks = build_daily_watchlist(base, limit=limit, min_price=min_price, min_oi=min_oi)
+    except Exception as e:
+        logger.warning(f"build_daily_watchlist failed: {e}")
+        return False
+
+    state.dynamic_watchlist = picks
+    state.dynamic_watchlist_date = today
+    state.save()
+    if picks:
+        sources = {}
+        for p in picks:
+            sources.setdefault(p["source"], []).append(p["symbol"])
+        summary = " | ".join(f"{src}: {','.join(syms)}" for src, syms in sources.items())
+        logger.info(f"Dynamic watchlist ({len(picks)}): {summary}")
+    else:
+        logger.info("Dynamic watchlist: no eligible movers passed filters today.")
+    return True
+
+
 def _force_top_score_paper(detector: RegimeDetector, state: BotState, regime: int,
                             portfolio_value: float) -> bool:
     """Paper-only safety valve. After `paper_force_after_HH:MM` ET, if no
@@ -857,6 +905,13 @@ def main_loop():
             write_heartbeat(state, regime=-1, regime_name="lockout", mode="halted")
             time.sleep(60)
             continue
+
+        # Pre-market daily hook: refresh dynamic watchlist once per day.
+        # Runs regardless of market-open gate since the screener works pre-market.
+        try:
+            refresh_dynamic_watchlist(state)
+        except Exception as e:
+            logger.warning(f"refresh_dynamic_watchlist raised: {e}")
 
         if not is_market_open():
             logger.info("Market closed. Sleeping 5 minutes.")

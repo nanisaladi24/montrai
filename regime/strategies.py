@@ -4,14 +4,44 @@ import config.runtime_config as rc
 
 
 def get_regime_watchlist(regime: int) -> List[str]:
-    watchlist = rc.get_watchlist()
-    # In crash regime trade nothing; in bear/euphoria trim to blue chips + indices
-    overrides: Dict[int, List[str]] = {
-        0: [],
-        1: [s for s in ["SPY", "QQQ", "JPM", "BAC"] if s in watchlist or s in ["SPY", "QQQ", "JPM", "BAC"]],
-        4: [s for s in ["SPY", "QQQ", "MSFT", "AAPL", "GOOGL"] if s in watchlist or s in ["SPY", "QQQ", "MSFT", "AAPL", "GOOGL"]],
-    }
-    return overrides.get(regime, watchlist)
+    """Base watchlist merged with today's dynamic mover list, narrowed by regime.
+
+    Crash regime → empty list (no trades).
+    Bear + Euphoria → narrow to blue-chips / indices only (ignore dynamic list
+    in these defensive regimes — we don't want to chase movers when risk is elevated).
+    All other regimes → base ∪ dynamic.
+    """
+    watchlist = list(rc.get_watchlist())
+
+    # Bear / Euphoria narrowing (defensive — stay with highly-liquid names only)
+    if regime == 0:
+        return []
+    if regime == 1:
+        candidates = ["SPY", "QQQ", "JPM", "BAC"]
+        return [s for s in candidates if s in watchlist or s in candidates]
+    if regime == 4:
+        candidates = ["SPY", "QQQ", "MSFT", "AAPL", "GOOGL"]
+        return [s for s in candidates if s in watchlist or s in candidates]
+
+    # Bull / Neutral: merge in today's dynamic movers (from bot_state.json)
+    try:
+        from core.position_tracker import BotState
+        state = BotState.load()
+        from datetime import date as _d
+        if state.dynamic_watchlist_date == _d.today().isoformat():
+            dynamic = [entry["symbol"] for entry in state.dynamic_watchlist
+                       if "symbol" in entry]
+            # Dedup while preserving order: static first, then new dynamic additions
+            seen = set(watchlist)
+            for sym in dynamic:
+                if sym not in seen:
+                    watchlist.append(sym)
+                    seen.add(sym)
+    except Exception:
+        # If state load fails, fall back to static watchlist silently
+        pass
+
+    return watchlist
 
 
 def compute_position_size(

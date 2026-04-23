@@ -186,6 +186,27 @@ with tab_live:
     else:
         st.info("No trade history yet.")
 
+    # ── Today's Dynamic Watchlist ─────────────────────────────────────────────
+    st.subheader("Today's Dynamic Watchlist")
+    dyn = state_data.get("dynamic_watchlist", [])
+    dyn_date = state_data.get("dynamic_watchlist_date", "")
+    today = datetime.now().strftime("%Y-%m-%d")
+    if dyn and dyn_date == today:
+        st.caption(f"Discovered pre-market via Alpaca movers + most-actives · {len(dyn)} symbols added on top of base watchlist")
+        rows = []
+        for entry in dyn:
+            rows.append({
+                "Symbol": entry.get("symbol"),
+                "Source": entry.get("source"),
+                "Price": f"${entry.get('price', 0):.2f}" if entry.get("price") else "—",
+                "% Change": f"{entry.get('percent_change', 0):+.2f}%" if entry.get("percent_change") else "—",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    elif dyn_date == today:
+        st.info("Dynamic watchlist refreshed today — no eligible movers passed the liquidity filter.")
+    else:
+        st.caption(f"Dynamic watchlist hasn't refreshed for today yet (last: {dyn_date or 'never'}). Bot will refresh on next pre-market cycle.")
+
     with st.expander("Regime Legend"):
         alloc = rc.get_regime_allocation()
         for k, v in REGIME_NAMES.items():
@@ -332,6 +353,28 @@ with tab_settings:
                                      value=int(cfg.get("covered_call_target_dte_min", 30)))
         cc_dte_max = st.number_input("CC DTE max", min_value=7, max_value=120, step=1,
                                      value=int(cfg.get("covered_call_target_dte_max", 45)))
+    # ── Dynamic Watchlist ──────────────────────────────────────────────────────
+    st.subheader("Dynamic Watchlist")
+    st.caption("Pre-market, pull top movers + most-actives from Alpaca, filter for options liquidity.")
+    dw1, dw2, dw3 = st.columns(3)
+    with dw1:
+        dyn_on = st.toggle("Enable dynamic watchlist",
+                           value=bool(cfg.get("dynamic_watchlist_enabled", True)),
+                           help="When on: merges today's top movers into the scan set for bull/neutral regimes.")
+    with dw2:
+        dyn_limit = st.number_input("Max daily additions",
+                                    min_value=5, max_value=50, step=5,
+                                    value=int(cfg.get("dynamic_watchlist_limit", 20)))
+        dyn_min_price = st.number_input("Min price ($)",
+                                        min_value=1.0, max_value=50.0, step=1.0,
+                                        value=float(cfg.get("dynamic_watchlist_min_price", 5.0)))
+    with dw3:
+        dyn_min_oi = st.number_input("Min ATM open interest",
+                                     min_value=50, max_value=5000, step=50,
+                                     value=int(cfg.get("dynamic_watchlist_min_oi", 500)))
+
+    st.divider()
+
     # ── Signal Thresholds + Paper Safety Valve ─────────────────────────────────
     st.subheader("Signal Thresholds")
     st.caption("How aggressive the bot is about firing. Lower threshold = more trades, noisier edge.")
@@ -566,6 +609,10 @@ with tab_settings:
             "intraday_min_orb_width_pct": float(intra_min_or_width),
             "intraday_take_profit_pct":  intra_tp / 100,
             "intraday_stop_loss_pct":    intra_sl / 100,
+            "dynamic_watchlist_enabled":   bool(dyn_on),
+            "dynamic_watchlist_limit":     int(dyn_limit),
+            "dynamic_watchlist_min_price": float(dyn_min_price),
+            "dynamic_watchlist_min_oi":    int(dyn_min_oi),
         })
         rc.save(cfg)
         st.success("Settings saved. Bot will pick them up on the next cycle.")

@@ -359,6 +359,100 @@ def test_robinhood_occ_parser():
     assert _parse_occ("garbage") is None
 
 
+# ── Dynamic watchlist ─────────────────────────────────────────────────────────
+
+def test_dynamic_watchlist_config_exposed():
+    import config.runtime_config as rc
+    cfg = rc.load()
+    for k in ("dynamic_watchlist_enabled", "dynamic_watchlist_limit",
+              "dynamic_watchlist_min_price", "dynamic_watchlist_min_oi",
+              "dynamic_watchlist_refresh_hour_et"):
+        assert k in cfg, f"missing key {k}"
+    assert cfg["dynamic_watchlist_enabled"] is True
+    assert cfg["dynamic_watchlist_limit"] == 20
+
+
+def test_dynamic_watchlist_filter_rejects_penny_and_warrants():
+    from discovery.dynamic_watchlist import filter_tradeable, Candidate
+    raw = [
+        Candidate("NVDA", 200.0, +5.0, "gainer"),       # keep
+        Candidate("AMPGR", 0.04, +99.5, "gainer"),      # reject (price too low)
+        Candidate("USGOW", 0.06, -49.6, "loser"),       # reject (warrant pattern + low price)
+        Candidate("VLN.WS", 0.01, -58.6, "loser"),      # reject (.WS suffix)
+        Candidate("TSLA", 392.0, +2.0, "gainer"),       # keep
+        Candidate("AKAN", 10.21, +214.15, "gainer"),    # keep — passes price filter
+    ]
+    filtered = filter_tradeable(raw, min_price=5.0)
+    symbols = {c.symbol for c in filtered}
+    assert "NVDA" in symbols
+    assert "TSLA" in symbols
+    assert "AKAN" in symbols
+    assert "AMPGR" not in symbols
+    assert "USGOW" not in symbols
+    assert "VLN.WS" not in symbols
+
+
+def test_dynamic_watchlist_filter_dedups():
+    from discovery.dynamic_watchlist import filter_tradeable, Candidate
+    # Same symbol from two sources — should dedup, preferring the gainer record
+    raw = [
+        Candidate("AAPL", 0.0, 0.0, "active"),
+        Candidate("AAPL", 275.0, +3.5, "gainer"),
+    ]
+    filtered = filter_tradeable(raw, min_price=5.0)
+    assert len(filtered) == 1
+    assert filtered[0].source == "gainer"
+
+
+def test_get_regime_watchlist_merges_dynamic(tmp_path, monkeypatch):
+    """Bull/neutral regimes must merge today's dynamic list on top of static watchlist."""
+    import config.settings as cfg
+    state_file = tmp_path / "bot_state.json"
+    monkeypatch.setattr(cfg, "STATE_FILE", str(state_file))
+    import core.position_tracker as pt
+    monkeypatch.setattr(pt, "STATE_FILE", str(state_file))
+
+    from core.position_tracker import BotState
+    from datetime import date
+    state = BotState()
+    state.dynamic_watchlist = [
+        {"symbol": "RIVN", "source": "gainer", "price": 15.0, "percent_change": 8.0},
+        {"symbol": "PLTR", "source": "active", "price": 45.0, "percent_change": 0.0},
+    ]
+    state.dynamic_watchlist_date = date.today().isoformat()
+    state.save()
+
+    from regime.strategies import get_regime_watchlist
+    result = get_regime_watchlist(2)   # Neutral regime → merge
+    assert "RIVN" in result
+    assert "PLTR" in result
+    # Base names still present
+    assert "SPY" in result or "AAPL" in result
+
+
+def test_get_regime_watchlist_skips_dynamic_in_defensive_regimes(tmp_path, monkeypatch):
+    """Bear + euphoria regimes should NOT include dynamic movers — defensive posture."""
+    import config.settings as cfg
+    state_file = tmp_path / "bot_state.json"
+    monkeypatch.setattr(cfg, "STATE_FILE", str(state_file))
+    import core.position_tracker as pt
+    monkeypatch.setattr(pt, "STATE_FILE", str(state_file))
+
+    from core.position_tracker import BotState
+    from datetime import date
+    state = BotState()
+    state.dynamic_watchlist = [{"symbol": "RIVN", "source": "gainer",
+                                 "price": 15.0, "percent_change": 8.0}]
+    state.dynamic_watchlist_date = date.today().isoformat()
+    state.save()
+
+    from regime.strategies import get_regime_watchlist
+    # Bear regime narrows to blue chips
+    assert "RIVN" not in get_regime_watchlist(1)
+    # Euphoria also narrows
+    assert "RIVN" not in get_regime_watchlist(4)
+
+
 # ── Intraday ORB + threshold knobs ────────────────────────────────────────────
 
 def test_threshold_config_exposed():

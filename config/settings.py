@@ -31,6 +31,15 @@ OPTIONS_MIN_DTE_EXIT    = 7          # Close when days-to-expiry drops below thi
 OPTIONS_TARGET_DTE      = (30, 45)   # Preferred expiry window at entry
 OPTIONS_TARGET_DELTA    = 0.40       # Target absolute delta for long-call/long-put strike
 
+# ── Dynamic Daily Watchlist ───────────────────────────────────────────────────
+# Pre-market discovery of top movers via Alpaca screener. Filtered for options
+# liquidity (ATM OI ≥ threshold). Merges with the static watchlist each day.
+DYNAMIC_WATCHLIST_ENABLED   = True
+DYNAMIC_WATCHLIST_LIMIT     = 20      # max additions per day on top of base
+DYNAMIC_WATCHLIST_MIN_PRICE = 5.0     # skip penny stocks (options are usually thin)
+DYNAMIC_WATCHLIST_MIN_OI    = 500     # ATM OI threshold at 30-45 DTE
+DYNAMIC_WATCHLIST_REFRESH_HOUR_ET = 9  # refresh at 09:00 ET (before market open)
+
 # ── Signal Thresholds ─────────────────────────────────────────────────────────
 # Score gates for entry. Dropped from ±0.6 to ±0.4 for more firing opportunity;
 # still filtered, just less strict. Raise back to 0.6 for conservative mode.
