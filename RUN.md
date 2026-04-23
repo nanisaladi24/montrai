@@ -163,14 +163,30 @@ Everything is off by default. Flip toggles from the dashboard Settings tab — t
 |---|---|---|
 | `options_trading_enabled` | Long calls / long puts | **ON** |
 | `spreads_enabled` | Vertical credit spreads (bull put credit, bear call credit) | OFF |
-| `iron_condor_enabled` | Iron condor when \|score\| < 0.3 | OFF |
+| `iron_condor_enabled` | Iron condor when \|score\| < 0.3 AND regime ∈ {neutral, bull, bear} (euphoria/panic skipped) | OFF |
 | `covered_call_enabled` | Write calls against held shares | OFF |
-| `intraday_enabled` | Opening Range Breakout strategy (5-min cycles) | OFF |
+| `intraday_enabled` | Opening Range Breakout strategy (5-min cycles) — every intraday open gets a broker-side OCO (TP + SL) | OFF |
 | `stock_trading_enabled` | Swing stock trades | OFF |
 | `dynamic_watchlist_enabled` | Pre-market mover discovery | **ON** |
 | `paper_force_top_score` | Paper-only: fire top-\|score\| if nothing filled by EOD | OFF |
 
+### Capital caps (hot-reloadable in dashboard Settings)
+| Knob | Meaning | Default |
+|---|---|---|
+| `options_max_daily_usd` | Per-day options premium flow cap (resets at midnight) | $1,000 |
+| `options_max_deployed_usd` | Rolling cap on options cost-basis + capital-at-risk (never resets, frees on close) | $10,000 |
+| `options_max_per_trade_pct` | Max fraction of deployed cap any single MLEG trade can use | 15% |
+| `stock_max_daily_usd` | Per-day stock notional flow cap | $10,000 |
+| `stock_max_deployed_usd` | Rolling cap on stock notional deployed | $50,000 |
+| `hmm_cache_min_intraday` | How often to re-run HMM regime detection during intraday mode | 30 min |
+
+Each new trade must pass BOTH the daily-flow cap AND the deployed cap; it's trimmed to whichever headroom is smaller.
+
 Same tab also lets you tune thresholds (score gates, delta targets, DTE windows, TP/SL percentages).
+
+### Recovery actions (dashboard → Circuit Breakers → 🛠 expander)
+- **Reset peak equity**: operator-gated button that sets `peak_equity = current_equity`, deletes `LOCKOUT`, and appends to `logs/recovery.log`. Stop the bot first so its in-memory state doesn't overwrite the reset.
+- **Emergency close-all**: `./.venv/bin/python scripts/close_all_positions.py` flattens every open option position at market.
 
 ---
 

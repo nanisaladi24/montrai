@@ -182,4 +182,28 @@ def build_daily_watchlist(
             "price": cand.price,
             "percent_change": round(cand.percent_change, 2),
         })
+    _hydrate_prices(results)
     return results
+
+
+def _hydrate_prices(results: list[dict]) -> None:
+    """Fill `price` for picks that came in without it (most_actives rows —
+    the SDK response omits price). Uses latest_quote only; percent_change
+    is left as-is to avoid piling daily-history fetches onto the already
+    chain-heavy refresh path."""
+    if not results:
+        return
+    try:
+        from core.market_data import latest_quote
+    except Exception as e:
+        logger.debug(f"price hydrate import failed: {e}")
+        return
+    for r in results:
+        if r.get("price"):
+            continue
+        try:
+            quote = latest_quote(r["symbol"])
+            if quote:
+                r["price"] = round(float(quote), 2)
+        except Exception as e:
+            logger.debug(f"latest_quote({r['symbol']}): {e}")

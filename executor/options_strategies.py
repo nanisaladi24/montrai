@@ -217,6 +217,9 @@ def select_spread_trade(
     )
 
 
+_IC_ALLOWED_REGIMES = {"neutral", "bull", "bear"}
+
+
 def select_iron_condor(
     underlying: str,
     score: float,
@@ -225,7 +228,13 @@ def select_iron_condor(
     max_risk_usd: float,
 ) -> Optional[SpreadPick]:
     """Iron condor for neutral / range-bound setups. Fires when conviction is
-    low (|score| < 0.3) — premium-harvest strategy that monetizes chop."""
+    low (|score| < 0.3) AND regime is moderate-vol (not euphoria/panic).
+    Euphoria and panic move past the wings; iron condors lose max in those
+    regimes."""
+    rn = (regime_name or "").lower()
+    if rn not in _IC_ALLOWED_REGIMES:
+        logger.debug(f"IC skip {underlying}: regime={rn} not in {_IC_ALLOWED_REGIMES}")
+        return None
     if abs(score) >= 0.30:
         return None  # Directional — let spread/long-option path handle it
     if max_risk_usd < 100:

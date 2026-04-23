@@ -45,6 +45,7 @@ class OptionsPosition:
     regime_at_entry: str = "unknown"
     strategy: str = "long_call"   # long_call | long_put | short_call_covered | intraday_orb | forced_paper
     intraday: bool = False        # True → force-close at EOD flatten window
+    stop_order_id: str = ""       # Broker-side protective stop (cancel when we close manually)
 
     @property
     def is_short(self) -> bool:
@@ -105,6 +106,7 @@ class MultiLegPosition:
     net_entry: float              # positive dollars per unit (|net debit| or |net credit|)
     entry_date: str
     regime_at_entry: str = "unknown"
+    origin: str = ""              # "" normal | "reconciled_ledger" | "reconciled_orphan" (skip SL)
 
     @property
     def is_credit(self) -> bool:
@@ -187,8 +189,14 @@ class BotState:
     # Dynamic watchlist — pre-market discovered movers, refreshed once per day
     dynamic_watchlist: list = field(default_factory=list)   # list[dict{symbol, source, price, percent_change}]
     dynamic_watchlist_date: str = ""
+    dynamic_watchlist_refreshed_at: str = ""   # ISO8601 UTC of last successful refresh
+    last_broker_sync_at: str = ""              # ISO8601 UTC of last successful reconcile with broker
 
     def reset_daily_if_new_day(self):
+        """Two layers of spend caps: daily-flow (resets each day) AND
+        deployed-capital (self-correcting from open positions). Daily flow
+        counters reset here; deployed caps are evaluated live against
+        *_capital_deployed helpers."""
         today = date.today().isoformat()
         if self.daily_date != today:
             self.daily_spent = 0.0
@@ -197,6 +205,36 @@ class BotState:
             self.daily_date = today
             self.is_halved = False
             logger.info("Daily counters reset for new trading day.")
+
+    def options_capital_deployed(self) -> float:
+        """Sum cost-basis / capital-at-risk across all open option positions.
+        This is the authoritative 'in play' number; risk_manager gates new
+        trades against it."""
+        total = 0.0
+        for mlp in self.multi_leg_positions.values():
+            qty = abs(mlp.qty)
+            if qty == 0 or not mlp.legs:
+                continue
+            calls = [l for l in mlp.legs if l.contract_type == "call"]
+            puts  = [l for l in mlp.legs if l.contract_type == "put"]
+            call_w = abs(calls[0].strike - calls[1].strike) if len(calls) == 2 else 0.0
+            put_w  = abs(puts[0].strike - puts[1].strike)   if len(puts) == 2 else 0.0
+            width = max(call_w, put_w)
+            if mlp.qty < 0:  # credit
+                per_unit = max(width - mlp.net_entry, 0.0)
+            else:            # debit
+                per_unit = mlp.net_entry
+            total += per_unit * qty * 100
+        for op in self.options_positions.values():
+            total += abs(op.entry_premium) * abs(op.qty) * 100
+        return round(total, 2)
+
+    def stock_capital_deployed(self) -> float:
+        """Sum notional of open stock positions."""
+        total = 0.0
+        for p in self.positions.values():
+            total += abs(p.entry_price) * abs(p.quantity)
+        return round(total, 2)
 
     def save(self):
         data = {
@@ -214,6 +252,8 @@ class BotState:
             "cycles": self.cycles,
             "dynamic_watchlist": self.dynamic_watchlist,
             "dynamic_watchlist_date": self.dynamic_watchlist_date,
+            "dynamic_watchlist_refreshed_at": self.dynamic_watchlist_refreshed_at,
+            "last_broker_sync_at": self.last_broker_sync_at,
         }
         with open(STATE_FILE, "w") as f:
             json.dump(data, f, indent=2)
@@ -237,6 +277,8 @@ class BotState:
             state.cycles = data.get("cycles", 0)
             state.dynamic_watchlist = data.get("dynamic_watchlist", []) or []
             state.dynamic_watchlist_date = data.get("dynamic_watchlist_date", "")
+            state.dynamic_watchlist_refreshed_at = data.get("dynamic_watchlist_refreshed_at", "")
+            state.last_broker_sync_at = data.get("last_broker_sync_at", "")
             for sym, pdata in data.get("positions", {}).items():
                 state.positions[sym] = Position(**pdata)
             for key, odata in data.get("options_positions", {}).items():

@@ -15,10 +15,18 @@ INTRADAY_ENABLED        = os.getenv("INTRADAY_ENABLED", "false").lower() == "tru
 # Two independent daily caps, one per asset class. Each is enforced on its own
 # counter in BotState so options risk is isolated from stock risk.
 OPTIONS_MAX_DAILY_USD = 1000.0       # Per-day premium spend cap on options
-STOCK_MAX_DAILY_USD   = 5000.0       # Per-day notional cap on stock buys (can raise)
+STOCK_MAX_DAILY_USD   = 10000.0      # Per-day notional cap on stock buys
 MAX_DAILY_SPEND_USD   = 1000.0       # Legacy combined cap; kept for back-compat
+
+# Deployed-capital caps — total dollars at risk across all open positions at
+# any time. Unlike the daily caps above these do NOT reset each day: closing
+# a position frees headroom immediately. Prevents multi-day trades from
+# silently accumulating past comfort level.
+OPTIONS_MAX_DEPLOYED_USD = 10000.0   # Max options cost-basis + capital-at-risk in play
+STOCK_MAX_DEPLOYED_USD   = 50000.0   # Max stock notional in play
+OPTIONS_MAX_PER_TRADE_PCT = 0.15     # Max fraction of deployed cap a single MLEG trade can consume
 MAX_POSITION_SIZE_PCT = 0.15         # Max 15% of portfolio in one stock
-MAX_OPEN_POSITIONS = 8               # Cap concurrent swing trades
+MAX_OPEN_POSITIONS = 20              # Cap concurrent positions (stocks + options + mleg combined)
 DAILY_LOSS_HALT_PCT = 0.02           # 2% daily loss → halve sizes
 PEAK_DRAWDOWN_LOCKOUT_PCT = 0.10     # 10% drawdown from peak → full stop
 STOP_LOSS_PCT = 0.05                 # 5% hard stop-loss per position
@@ -159,6 +167,7 @@ FINANCIAL_DATASETS_API_KEY = os.getenv("FINANCIAL_DATASETS_API_KEY", "")
 LOG_DIR = "logs"
 TRADE_LOG_FILE = f"{LOG_DIR}/trades.csv"
 STATE_FILE = "bot_state.json"
+ORDERS_LEDGER_FILE = "orders_ledger.json"  # durable MLEG submission record for reconciliation
 LOCKOUT_FILE = "LOCKOUT"            # Presence of this file halts the bot
 
 # ── Backtester ─────────────────────────────────────────────────────────────────

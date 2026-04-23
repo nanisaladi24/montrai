@@ -33,14 +33,26 @@ logger = get_logger("polygon")
 
 _BASE = "https://api.polygon.io"
 
+# Paths served by Polygon's Options tier. When POLYGON_OPTIONS_ONLY is on,
+# _get() silently skips any path outside this allow-list, so an options-only
+# subscription never burns quota on stock/index endpoints it can't serve.
+_OPTIONS_PATH_PREFIXES = ("/v3/snapshot/options/", "/v3/reference/options/")
+
 
 def _api_key() -> str:
     return os.getenv("POLYGON_API_KEY", "") or ""
 
 
+def _options_only() -> bool:
+    return os.getenv("POLYGON_OPTIONS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _get(path: str, params: Optional[dict] = None) -> Optional[dict]:
     key = _api_key()
     if not key:
+        return None
+    if _options_only() and not any(path.startswith(p) for p in _OPTIONS_PATH_PREFIXES):
+        logger.debug(f"polygon GET {path}: skipped (POLYGON_OPTIONS_ONLY=true)")
         return None
     query = dict(params or {})
     query["apiKey"] = key

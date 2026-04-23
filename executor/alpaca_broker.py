@@ -15,6 +15,15 @@ from monitoring.logger import get_logger, log_trade
 logger = get_logger("alpaca_broker")
 
 
+def _underlying_from_occ(contract_symbol: str) -> str:
+    """Strip OCC suffix (YYMMDD + C/P + 8-digit strike) to recover the
+    underlying ticker. Accepts 'O:' prefix."""
+    s = contract_symbol[2:] if contract_symbol.startswith("O:") else contract_symbol
+    if len(s) < 15:
+        return ""
+    return s[:-15]
+
+
 class AlpacaBroker(BrokerBase):
 
     def __init__(self, api_key: str, secret_key: str, paper: bool = True):
@@ -159,11 +168,24 @@ class AlpacaBroker(BrokerBase):
         return True
 
     def buy_option(self, contract_symbol: str, qty: int, limit_price: float,
-                   regime_name: str = "") -> Optional[str]:
-        """Open a long option position (BUY_TO_OPEN). Single-leg limit order."""
+                   regime_name: str = "",
+                   protective_tp_pct: float = 0.0,
+                   protective_sl_pct: float = 0.0) -> Optional[str]:
+        """Open a long option position (BUY_TO_OPEN). Single-leg limit order.
+
+        If both `protective_tp_pct` and `protective_sl_pct` > 0, waits for
+        the buy to fill and then submits an **OCO sell** (one limit TP +
+        one stop-limit SL). Whichever fills first auto-cancels the other —
+        broker-side TP/SL management, no polling needed. The paired order
+        id is recorded at `_last_stop_order_id` for the caller to persist
+        (so we can cancel it if we manually exit via TP/DTE/regime change).
+        """
+        self._last_stop_order_id = None
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
-            from alpaca.trading.requests import LimitOrderRequest
+            from alpaca.trading.requests import (
+                LimitOrderRequest, StopOrderRequest, StopLossRequest, TakeProfitRequest,
+            )
             req = LimitOrderRequest(
                 symbol=contract_symbol,
                 qty=qty,
@@ -177,6 +199,60 @@ class AlpacaBroker(BrokerBase):
             log_trade(contract_symbol, "BUY_OPT", qty, limit_price,
                       "open_long", regime_name, order_id)
             logger.info(f"BUY_OPT {contract_symbol} x{qty} @ ${limit_price:.2f} → {order_id}")
+
+            want_tp = protective_tp_pct and protective_tp_pct > 0
+            want_sl = protective_sl_pct and protective_sl_pct > 0
+            if want_tp or want_sl:
+                status = self.wait_for_order_fill(order_id, timeout_sec=5.0)
+                if status != "filled":
+                    logger.warning(f"  skip protective order — buy {order_id} status={status}")
+                    return order_id
+                fill_price = limit_price
+                try:
+                    o = self._trading.get_order_by_id(order_id)
+                    if getattr(o, "filled_avg_price", None):
+                        fill_price = float(o.filled_avg_price)
+                except Exception:
+                    pass
+
+                if want_tp and want_sl:
+                    # OCO: limit-sell TP + stop-limit SL — broker cancels the
+                    # other automatically on fill
+                    tp_price = round(fill_price * (1 + protective_tp_pct), 2)
+                    sl_trigger = round(max(fill_price * (1 - protective_sl_pct), 0.01), 2)
+                    sl_limit   = round(max(sl_trigger * 0.95, 0.01), 2)
+                    try:
+                        oco_req = LimitOrderRequest(
+                            symbol=contract_symbol,
+                            qty=qty,
+                            limit_price=tp_price,
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.GTC,
+                            order_class=OrderClass.OCO,
+                            stop_loss=StopLossRequest(stop_price=sl_trigger, limit_price=sl_limit),
+                        )
+                        oco = self._trading.submit_order(oco_req)
+                        self._last_stop_order_id = str(oco.id)
+                        logger.info(f"  OCO: TP ${tp_price:.2f} / SL trigger ${sl_trigger:.2f} → {self._last_stop_order_id}")
+                    except Exception as e:
+                        logger.error(f"  OCO submit failed for {contract_symbol}: {e} — falling back to bare stop")
+                        want_tp = False  # fall through to SL-only path below
+                if want_sl and not self._last_stop_order_id:
+                    # SL-only fallback (OCO failed or TP not requested)
+                    stop_price = round(max(fill_price * (1 - protective_sl_pct), 0.01), 2)
+                    try:
+                        stop_req = StopOrderRequest(
+                            symbol=contract_symbol,
+                            qty=qty,
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.DAY,
+                            stop_price=stop_price,
+                        )
+                        stop = self._trading.submit_order(stop_req)
+                        self._last_stop_order_id = str(stop.id)
+                        logger.info(f"  protective STOP @ ${stop_price:.2f} → {self._last_stop_order_id}")
+                    except Exception as e:
+                        logger.error(f"  protective stop submit failed for {contract_symbol}: {e}")
             return order_id
         except Exception as e:
             logger.error(f"buy_option({contract_symbol} x{qty}): {e}")
@@ -218,8 +294,11 @@ class AlpacaBroker(BrokerBase):
         order_side: str,
         strategy: str = "",
         regime_name: str = "",
+        **kwargs,
     ) -> Optional[str]:
         """Submit a multi-leg (2-leg vertical or 4-leg iron condor) order to Alpaca.
+        Pass use_market=True to submit a MarketOrderRequest instead of limit —
+        for emergency SL exits where fill speed > price.
 
         legs item format: {"contract_symbol": "O:SPY...", "side": "buy"|"sell", "position_intent": "open"|"close"}
 
@@ -252,19 +331,42 @@ class AlpacaBroker(BrokerBase):
                     position_intent=intent,
                     ratio_qty=lg.get("ratio_qty", 1),
                 ))
-            req = LimitOrderRequest(
-                qty=qty,
-                order_class=OrderClass.MLEG,
-                time_in_force=TimeInForce.DAY,
-                limit_price=round(abs(net_limit_price), 2),
-                side=side_map[order_side],
-                legs=leg_reqs,
-            )
+            use_market = kwargs.get("use_market", False)
+            if use_market:
+                from alpaca.trading.requests import MarketOrderRequest
+                req = MarketOrderRequest(
+                    qty=qty,
+                    order_class=OrderClass.MLEG,
+                    time_in_force=TimeInForce.DAY,
+                    side=side_map[order_side],
+                    legs=leg_reqs,
+                )
+            else:
+                req = LimitOrderRequest(
+                    qty=qty,
+                    order_class=OrderClass.MLEG,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round(abs(net_limit_price), 2),
+                    side=side_map[order_side],
+                    legs=leg_reqs,
+                )
             order = self._trading.submit_order(req)
             order_id = str(order.id)
             leg_desc = " / ".join(f"{lg['side']} {lg['contract_symbol']}" for lg in legs)
-            log_trade(strategy or "MLEG", "MLEG", qty, net_limit_price,
-                      f"{order_side}_{strategy}", regime_name, order_id)
+            underlying = _underlying_from_occ(legs[0]["contract_symbol"]) if legs else ""
+            log_trade(underlying or (strategy or "MLEG"), "MLEG", qty, net_limit_price,
+                      f"{order_side}_{strategy}", regime_name, order_id,
+                      strategy=strategy or "")
+            # Durable ledger record — authoritative net_entry source for reconciliation
+            try:
+                from core.orders_ledger import record_multi_leg_submission
+                record_multi_leg_submission(
+                    order_id=order_id, strategy=strategy or "",
+                    underlying=underlying, legs=legs, qty=qty,
+                    net_limit_price=net_limit_price, order_side=order_side,
+                )
+            except Exception as e:
+                logger.warning(f"ledger record failed: {e}")
             logger.info(f"MLEG {strategy} x{qty} @ net ${net_limit_price:.2f} ({order_side}): "
                         f"{leg_desc} → {order_id}")
             return order_id
@@ -311,6 +413,105 @@ class AlpacaBroker(BrokerBase):
                 "market_value": float(getattr(p, "market_value", 0) or 0),
             })
         return out
+
+    # ── Order lifecycle helpers (fast fill / stale cleanup) ──────────────────
+
+    def cancel_stale_orders(self, max_age_seconds: int = 180) -> int:
+        """Cancel any open orders older than max_age_seconds. Prevents the
+        'held_for_orders' lockout where a stale limit close blocks new
+        MLEG submissions on the same legs. Returns count cancelled."""
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            from datetime import datetime, timezone
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+            orders = self._trading.get_orders(filter=req)
+        except Exception as e:
+            logger.debug(f"cancel_stale_orders list failed: {e}")
+            return 0
+        now = datetime.now(timezone.utc)
+        cancelled = 0
+        for o in orders:
+            submitted = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
+            if not submitted:
+                continue
+            age = (now - submitted).total_seconds()
+            if age < max_age_seconds:
+                continue
+            try:
+                self._trading.cancel_order_by_id(str(o.id))
+                logger.warning(f"cancelled stale order {o.id} ({o.symbol or o.order_class}) age={age:.0f}s")
+                cancelled += 1
+            except Exception as e:
+                logger.warning(f"cancel {o.id} failed: {e}")
+        return cancelled
+
+    def wait_for_order_fill(self, order_id: str, timeout_sec: float = 8.0, poll_sec: float = 0.5) -> str:
+        """Poll an order until filled / cancelled / expired / timeout.
+        Returns final status string. Used on SL exits to verify the fill
+        landed fast; caller escalates to market if status != 'filled'."""
+        import time as _time
+        end = _time.time() + timeout_sec
+        last_status = "unknown"
+        while _time.time() < end:
+            try:
+                o = self._trading.get_order_by_id(order_id)
+                last_status = str(o.status).split(".")[-1].lower()
+                if last_status in ("filled", "canceled", "expired", "rejected", "done_for_day"):
+                    return last_status
+            except Exception as e:
+                logger.debug(f"wait_for_order_fill poll failed: {e}")
+            _time.sleep(poll_sec)
+        return last_status
+
+    # ── Account baseline (authoritative peak for drawdown) ────────────────────
+
+    _baseline_cache: dict = {"value": None, "ts": None}
+
+    def get_account_baseline(self) -> float:
+        """Returns max(starting_capital, historical_peak_equity) from Alpaca's
+        full portfolio history. Cached 1h — peak moves rarely enough, and
+        the full-period history fetch is heavy."""
+        import time as _time
+        cache = AlpacaBroker._baseline_cache
+        now = _time.time()
+        if cache["value"] is not None and cache["ts"] and (now - cache["ts"]) < 3600:
+            return cache["value"]
+        try:
+            h = self.get_portfolio_history(period="all", timeframe="1D")
+            equity = [e for e in (h.get("equity") or []) if e and e > 0]
+            base_value = float(h.get("base_value") or 0)
+            historical_peak = max(equity) if equity else 0.0
+            baseline = max(base_value, historical_peak)
+        except Exception as e:
+            logger.warning(f"get_account_baseline: falling back to get_account: {e}")
+            try:
+                acct = self._trading.get_account()
+                baseline = float(getattr(acct, "equity", 0) or 0)
+            except Exception:
+                baseline = 0.0
+        cache["value"] = baseline
+        cache["ts"] = now
+        return baseline
+
+    # ── Portfolio history (for perf charts) ───────────────────────────────────
+
+    def get_portfolio_history(self, period: str = "1M", timeframe: str = "1D") -> dict:
+        try:
+            from alpaca.trading.requests import GetPortfolioHistoryRequest
+            req = GetPortfolioHistoryRequest(period=period, timeframe=timeframe)
+            h = self._trading.get_portfolio_history(req)
+        except Exception as e:
+            logger.warning(f"get_portfolio_history({period}, {timeframe}): {e}")
+            return {"timestamps": [], "equity": [], "profit_loss": [],
+                    "profit_loss_pct": [], "base_value": 0.0}
+        return {
+            "timestamps":      [int(t) for t in (getattr(h, "timestamp", None) or [])],
+            "equity":          [float(e or 0) for e in (getattr(h, "equity", None) or [])],
+            "profit_loss":     [float(p or 0) for p in (getattr(h, "profit_loss", None) or [])],
+            "profit_loss_pct": [float(p or 0) for p in (getattr(h, "profit_loss_pct", None) or [])],
+            "base_value":      float(getattr(h, "base_value", 0) or 0),
+        }
 
     # ── Data helpers ──────────────────────────────────────────────────────────
 

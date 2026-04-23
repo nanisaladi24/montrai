@@ -39,32 +39,55 @@ class RiskManager:
     # ── Circuit Breaker 2a: Stock daily spend cap ─────────────────────────────
     @staticmethod
     def check_daily_spend(state: BotState, proposed_dollars: float) -> RiskVerdict:
+        """Stock spend check — must pass BOTH caps:
+          • daily flow cap (resets each day) — how much fresh notional to deploy today
+          • deployed cap — max total notional in play at any time
+        Proposed size is trimmed to whichever headroom is smaller."""
         state.reset_daily_if_new_day()
         cfg = rc.load()
         max_daily = cfg.get("stock_max_daily_usd",
                             cfg.get("max_daily_spend_usd", _cfg.STOCK_MAX_DAILY_USD))
-        remaining = max_daily - state.daily_spent
-        if remaining <= 0:
-            return RiskVerdict(False, f"Stock daily spend cap hit (${max_daily})", 0.0)
-        allowed = min(proposed_dollars, remaining)
+        max_deployed = cfg.get("stock_max_deployed_usd", _cfg.STOCK_MAX_DEPLOYED_USD)
+        daily_remain    = max_daily - state.daily_spent
+        deployed_remain = max_deployed - state.stock_capital_deployed()
+        if daily_remain <= 0:
+            return RiskVerdict(False, f"Stock daily cap hit (${max_daily:.0f})", 0.0)
+        if deployed_remain <= 0:
+            return RiskVerdict(False, f"Stock deployed cap hit (${state.stock_capital_deployed():.0f}/${max_deployed:.0f})", 0.0)
+        allowed = min(proposed_dollars, daily_remain, deployed_remain)
         if allowed < proposed_dollars:
-            logger.warning(f"Stock trade size trimmed to ${allowed:.2f} (daily cap ${max_daily})")
-        return RiskVerdict(True, "within stock daily cap", allowed)
+            logger.warning(
+                f"Stock trade trimmed to ${allowed:.2f} · "
+                f"daily ${state.daily_spent:.0f}/${max_daily:.0f} · "
+                f"deployed ${state.stock_capital_deployed():.0f}/${max_deployed:.0f}"
+            )
+        return RiskVerdict(True, "within stock caps", allowed)
 
-    # ── Circuit Breaker 2b: Options daily premium cap ─────────────────────────
+    # ── Circuit Breaker 2b: Options daily + deployed caps ─────────────────────
     @staticmethod
     def check_options_daily_spend(state: BotState, proposed_dollars: float) -> RiskVerdict:
-        """Options premium cap is *separate* from the stock cap. Hitting the
-        $1000/day options limit does not affect the stock budget and vice-versa."""
+        """Options spend — must pass BOTH caps:
+          • daily premium cap (flow, resets each day)
+          • deployed cap — total cost-basis + capital-at-risk currently in play
+        """
         state.reset_daily_if_new_day()
-        max_daily = rc.load().get("options_max_daily_usd", _cfg.OPTIONS_MAX_DAILY_USD)
-        remaining = max_daily - state.options_daily_spent
-        if remaining <= 0:
-            return RiskVerdict(False, f"Options daily cap hit (${max_daily})", 0.0)
-        allowed = min(proposed_dollars, remaining)
+        cfg = rc.load()
+        max_daily = cfg.get("options_max_daily_usd", _cfg.OPTIONS_MAX_DAILY_USD)
+        max_deployed = cfg.get("options_max_deployed_usd", _cfg.OPTIONS_MAX_DEPLOYED_USD)
+        daily_remain    = max_daily - state.options_daily_spent
+        deployed_remain = max_deployed - state.options_capital_deployed()
+        if daily_remain <= 0:
+            return RiskVerdict(False, f"Options daily cap hit (${max_daily:.0f})", 0.0)
+        if deployed_remain <= 0:
+            return RiskVerdict(False, f"Options deployed cap hit (${state.options_capital_deployed():.0f}/${max_deployed:.0f})", 0.0)
+        allowed = min(proposed_dollars, daily_remain, deployed_remain)
         if allowed < proposed_dollars:
-            logger.warning(f"Options premium trimmed to ${allowed:.2f} (daily cap ${max_daily})")
-        return RiskVerdict(True, "within options daily cap", allowed)
+            logger.warning(
+                f"Options premium trimmed to ${allowed:.2f} · "
+                f"daily ${state.options_daily_spent:.0f}/${max_daily:.0f} · "
+                f"deployed ${state.options_capital_deployed():.0f}/${max_deployed:.0f}"
+            )
+        return RiskVerdict(True, "within options caps", allowed)
 
     # ── Circuit Breaker 3: Daily loss trigger ─────────────────────────────────
     @staticmethod
@@ -81,6 +104,17 @@ class RiskManager:
     # ── Circuit Breaker 4: Peak drawdown lockout ──────────────────────────────
     @staticmethod
     def check_peak_drawdown(portfolio_value: float, state: BotState) -> bool:
+        # Floor peak with broker's authoritative baseline (starting capital +
+        # historical peak from Alpaca's portfolio history) so a bot restart
+        # during a drawdown can't seed peak from a drawdown-era snapshot.
+        try:
+            from executor.order_executor import get_account_baseline
+            broker_baseline = get_account_baseline()
+            if broker_baseline > state.peak_equity:
+                state.peak_equity = broker_baseline
+                state.save()
+        except Exception as e:
+            logger.debug(f"get_account_baseline failed: {e}")
         if portfolio_value > state.peak_equity:
             state.peak_equity = portfolio_value
             state.save()
@@ -163,11 +197,16 @@ class RiskManager:
         current_net_value: float,  # absolute per-unit dollars to close now
         qty: int,                  # signed: +N = long/debit, -N = short/credit
         dte: int,
+        skip_sl: bool = False,     # True for reconciled orphans — entry can't be trusted
     ) -> Tuple[bool, str]:
         """Direction-aware exit for vertical spreads + iron condors.
 
         Long spread (debit): TP when current ≥ entry × (1+tp); SL when current ≤ entry × (1-sl).
         Short spread (credit): TP when current ≤ entry × (1-tp); SL when current ≥ entry × 2.
+
+        When skip_sl=True (orphan reconciliation fallback), stop-loss paths
+        are suppressed because we don't have an authoritative entry price —
+        we rely on TP + DTE to exit.
         """
         cfg = rc.load()
         tp = cfg.get("spread_take_profit_pct", _cfg.SPREAD_TAKE_PROFIT_PCT)
@@ -179,13 +218,13 @@ class RiskManager:
             pct = (current_net_value - net_entry) / net_entry
             if pct >= tp:
                 return True, f"debit TP +{pct:.1%}"
-            if pct <= -sl:
+            if pct <= -sl and not skip_sl:
                 return True, f"debit SL {pct:.1%}"
         else:         # credit — we sold it
             decay = (net_entry - current_net_value) / net_entry
             if decay >= tp:
                 return True, f"credit TP decay {decay:.1%}"
-            if current_net_value >= net_entry * 2:
+            if current_net_value >= net_entry * 2 and not skip_sl:
                 return True, f"credit SL ({current_net_value:.2f} vs entry {net_entry:.2f})"
         if dte <= min_dte:
             return True, f"DTE {dte} ≤ {min_dte}"

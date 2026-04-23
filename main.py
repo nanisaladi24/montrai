@@ -15,6 +15,7 @@ import time
 import sys
 import pandas as pd
 from datetime import datetime, timezone
+from typing import Optional
 from pathlib import Path
 
 from config.settings import TRADING_MODE
@@ -36,6 +37,216 @@ from monitoring.logger import get_logger
 logger = get_logger("main")
 
 HEARTBEAT_FILE = "bot_heartbeat.json"
+
+
+def _parse_occ_symbol(occ: str) -> Optional[dict]:
+    """Parse Alpaca/Polygon OCC option symbol → {underlying, expiry, type, strike}."""
+    s = occ[2:] if occ.startswith("O:") else occ
+    if len(s) < 15:
+        return None
+    try:
+        strike = int(s[-8:]) / 1000.0
+        type_char = s[-9]
+        date_str = s[-15:-9]
+        underlying = s[:-15]
+        return {
+            "contract_symbol": occ,
+            "underlying": underlying,
+            "expiry": f"20{date_str[:2]}-{date_str[2:4]}-{date_str[4:6]}",
+            "contract_type": "call" if type_char.upper() == "C" else "put",
+            "strike": strike,
+        }
+    except Exception:
+        return None
+
+
+def reconcile_from_broker(state: BotState) -> None:
+    """Two-way sync with the broker — Alpaca is the source of truth.
+
+    Adopt: positions at broker that state doesn't know about get synthesized
+    into tracked entries so exit logic can manage them. Uses the order ledger
+    for authoritative net_entry when available; falls back to broker cost
+    basis + skip_sl flag for truly orphan positions.
+
+    Prune: tracked positions whose legs are no longer present at the broker
+    (user closed manually, or filled via another channel) get removed from
+    state. Partial mismatches (some legs missing) get a warning but are
+    left alone to avoid accidental data loss.
+    """
+    try:
+        live = get_option_positions()
+    except Exception as e:
+        logger.warning(f"reconcile_from_broker: could not fetch broker positions: {e}")
+        return
+
+    broker_symbols = {p["symbol"] for p in live}
+    # Normalize: symbols may or may not have the "O:" prefix between broker + state
+    broker_syms_norm = {s.lstrip("O:") for s in broker_symbols} | broker_symbols
+
+    # ── Prune tracked multi-leg positions whose legs disappeared at broker ──
+    dirty = False
+    for key in list(state.multi_leg_positions.keys()):
+        mlp = state.multi_leg_positions[key]
+        leg_syms = [leg.contract_symbol for leg in mlp.legs]
+        present = [s for s in leg_syms if s in broker_syms_norm or s.lstrip("O:") in broker_syms_norm]
+        if len(present) == 0:
+            logger.info(f"reconcile: pruning {mlp.strategy} {mlp.underlying} x{abs(mlp.qty)} — all legs closed at broker")
+            del state.multi_leg_positions[key]
+            dirty = True
+        elif len(present) < len(leg_syms):
+            logger.warning(f"reconcile: {mlp.strategy} {mlp.underlying} partial mismatch "
+                           f"({len(present)}/{len(leg_syms)} legs at broker) — left in state for manual review")
+
+    # ── Prune tracked single-leg options that are no longer at broker ──
+    for sym in list(state.options_positions.keys()):
+        if sym not in broker_syms_norm and sym.lstrip("O:") not in broker_syms_norm:
+            logger.info(f"reconcile: pruning single-leg {sym} — no longer at broker")
+            del state.options_positions[sym]
+            dirty = True
+
+    # Stamp sync time regardless of whether changes were made
+    state.last_broker_sync_at = datetime.now(timezone.utc).isoformat()
+
+    if not live:
+        if dirty:
+            state.save()
+        else:
+            state.save()  # still persist the sync timestamp
+        return
+
+    tracked_contracts: set[str] = set()
+    for mlp in state.multi_leg_positions.values():
+        for leg in mlp.legs:
+            tracked_contracts.add(leg.contract_symbol)
+            tracked_contracts.add(f"O:{leg.contract_symbol}" if not leg.contract_symbol.startswith("O:") else leg.contract_symbol[2:])
+    for sym in state.options_positions.keys():
+        tracked_contracts.add(sym)
+        tracked_contracts.add(f"O:{sym}" if not sym.startswith("O:") else sym[2:])
+
+    orphans = [p for p in live if p["symbol"] not in tracked_contracts and p["symbol"].lstrip("O:") not in tracked_contracts]
+    if not orphans:
+        if dirty:
+            state.save()
+        else:
+            state.save()
+        return
+    logger.info(f"reconcile_from_broker: {len(orphans)} orphan leg(s) found at broker — adopting into state")
+
+    # Group by underlying + expiry so multi-leg structures stay together
+    groups: dict[tuple, list[dict]] = {}
+    singletons: list[dict] = []
+    parsed_cache: dict[str, dict] = {}
+    for p in orphans:
+        parsed = _parse_occ_symbol(p["symbol"])
+        if not parsed:
+            singletons.append(p)
+            continue
+        parsed_cache[p["symbol"]] = parsed
+        groups.setdefault((parsed["underlying"], parsed["expiry"]), []).append(p)
+
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    for (underlying, expiry), group in groups.items():
+        if len(group) == 1:
+            singletons.append(group[0])
+            continue
+        if len(group) not in (2, 4):
+            logger.warning(f"reconcile: {underlying} {expiry} has {len(group)} orphan legs — skipping (not a vertical/condor)")
+            for p in group:
+                singletons.append(p)
+            continue
+        legs: list[OptionLeg] = []
+        for p in group:
+            parsed = parsed_cache[p["symbol"]]
+            leg_qty = p["qty"]                       # signed int from broker
+            side = "short" if leg_qty < 0 else "long"
+            legs.append(OptionLeg(
+                contract_symbol=p["symbol"],
+                side=side,
+                contract_type=parsed["contract_type"],
+                strike=parsed["strike"],
+                expiry=parsed["expiry"],
+                entry_price=abs(p["avg_entry_price"]),
+                ratio_qty=1,
+            ))
+
+        # Classify strategy + credit/debit from STRIKE STRUCTURE (reliable) —
+        # broker-reported avg_entry_price can be noisy or signed unpredictably.
+        calls = [l for l in legs if l.contract_type == "call"]
+        puts  = [l for l in legs if l.contract_type == "put"]
+        strategy: Optional[str] = None
+        is_credit = False
+        if len(group) == 4 and len(calls) == 2 and len(puts) == 2:
+            strategy = "iron_condor"
+            is_credit = True   # standard iron condor is always credit
+        elif len(calls) == 2 and len(puts) == 0:
+            short = next((l for l in calls if l.side == "short"), None)
+            long_ = next((l for l in calls if l.side == "long"), None)
+            if short and long_:
+                if short.strike < long_.strike:
+                    strategy, is_credit = "bear_call_credit", True
+                else:
+                    strategy, is_credit = "bull_call_debit", False
+        elif len(puts) == 2 and len(calls) == 0:
+            short = next((l for l in puts if l.side == "short"), None)
+            long_ = next((l for l in puts if l.side == "long"), None)
+            if short and long_:
+                if short.strike > long_.strike:
+                    strategy, is_credit = "bull_put_credit", True
+                else:
+                    strategy, is_credit = "bear_put_debit", False
+        if strategy is None:
+            logger.warning(f"reconcile: {underlying} {expiry} — unrecognized leg mix, skipping")
+            continue
+
+        # Ledger-first: look up the submitted net limit price (authoritative)
+        from core.orders_ledger import find_matching_open
+        leg_syms = {l.contract_symbol for l in legs}
+        ledger_entry = find_matching_open(underlying, leg_syms)
+
+        unit_count = abs(group[0]["qty"])
+        pos_qty = -unit_count if is_credit else unit_count
+
+        if ledger_entry:
+            net_entry = float(ledger_entry["net_limit_price"])
+            origin = "reconciled_ledger"
+        else:
+            # No ledger trace — broker avg_entry_price is noisy on paper fills
+            # and can't be trusted for SL math. Fall back to it for visibility,
+            # but flag the position so exit logic skips the stop-loss path.
+            short_sum = sum(l.entry_price for l in legs if l.side == "short")
+            long_sum  = sum(l.entry_price for l in legs if l.side == "long")
+            net_entry = round(abs(short_sum - long_sum), 4)
+            origin = "reconciled_orphan"
+
+        key = f"{underlying}_{strategy}_reconciled_{today.replace('-', '')}_{len(state.multi_leg_positions)}"
+        state.multi_leg_positions[key] = MultiLegPosition(
+            key=key, strategy=strategy, underlying=underlying,
+            legs=legs, qty=pos_qty, net_entry=net_entry,
+            entry_date=today, regime_at_entry="reconciled",
+            origin=origin,
+        )
+        logger.info(f"reconcile: adopted {strategy} {underlying} {expiry} x{unit_count} "
+                    f"net ${net_entry:.2f} ({'credit' if is_credit else 'debit'}) [{origin}]")
+
+    for p in singletons:
+        parsed = _parse_occ_symbol(p["symbol"]) or {}
+        qty = p["qty"]
+        state.options_positions[p["symbol"]] = OptionsPosition(
+            contract_symbol=p["symbol"],
+            underlying=parsed.get("underlying", ""),
+            side=parsed.get("contract_type", "call"),
+            strike=parsed.get("strike", 0.0),
+            expiry=parsed.get("expiry", ""),
+            qty=qty,
+            entry_premium=p["avg_entry_price"],
+            entry_date=today,
+            regime_at_entry="reconciled",
+            strategy="reconciled",
+        )
+        logger.info(f"reconcile: adopted singleton {p['symbol']} qty={qty} @ ${p['avg_entry_price']:.2f}")
+
+    state.save()
 
 
 def write_heartbeat(state: BotState, regime: int, regime_name: str, mode: str):
@@ -354,14 +565,36 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
     cfg = rc.load()
     regime_name = detector.regime_name(regime)
 
+    # Cancel stale limit orders before trying to close/open — prevents the
+    # "held_for_orders" lockout where stale orders block new MLEG submits.
+    try:
+        from executor.order_executor import cancel_stale_orders, wait_for_order_fill
+        cancelled = cancel_stale_orders(max_age_seconds=180)
+        if cancelled:
+            logger.warning(f"cancelled {cancelled} stale order(s) before multi-leg phase")
+    except Exception as e:
+        logger.debug(f"cancel_stale_orders failed: {e}")
+
     # ── 1. Exits on existing multi-leg positions ───────────────────────────────
     for key, pos in list(state.multi_leg_positions.items()):
         current_value = _current_spread_value(pos)
         if current_value <= 0:
             continue
+        is_orphan = getattr(pos, "origin", "") == "reconciled_orphan"
         should_exit, reason = RiskManager.should_exit_multi_leg(
-            pos.net_entry, current_value, pos.qty, pos.dte()
+            pos.net_entry, current_value, pos.qty, pos.dte(),
+            skip_sl=is_orphan,
         )
+        # Orphan emergency SL: when the bot can't trust the entry price, fall
+        # back to proximity-to-max-loss as the safety gauge. For credit
+        # spreads, max loss ≈ wing_width − credit (per unit). If current
+        # close value is ≥ 75% of the wing width, the position is within
+        # striking distance of max loss → force close regardless of entry.
+        emergency = False
+        if is_orphan and not should_exit and pos.is_credit:
+            w = pos.width
+            if w > 0 and current_value >= w * 0.75:
+                should_exit, reason, emergency = True, f"orphan emergency SL ({current_value:.2f} vs width {w:.1f})", True
         if not should_exit:
             continue
         # Build closing legs: reverse each leg's side/intent
@@ -375,16 +608,30 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
             })
         # Closing a credit spread = BUY to close (net debit paid); closing a debit = SELL (net credit)
         close_side = "buy" if pos.is_credit else "sell"
-        # Pay/receive current net value as limit
+        # SL / emergency exits use market orders for guaranteed fast fill;
+        # TP and DTE exits use limit orders to capture a good price.
+        is_sl_exit = emergency or ("SL" in reason) or ("emergency" in reason)
         order_id = submit_multi_leg_order(
             legs=closing_legs, qty=pos.unit_count, net_limit_price=current_value,
             order_side=close_side, strategy=f"close_{pos.strategy}",
-            regime_name=regime_name,
+            regime_name=regime_name, use_market=is_sl_exit,
         )
-        if order_id:
-            pnl = state.close_multi_leg_position(key, current_value)
-            logger.info(f"MLEG CLOSED {pos.strategy} {pos.underlying} x{pos.unit_count} "
-                        f"@ net ${current_value:.2f} | P&L ${pnl:+.2f} | {reason}")
+        if not order_id:
+            logger.error(f"MLEG close rejected for {key} ({reason})")
+            continue
+        # Fast fill verification — poll up to 8s. If a limit-order TP/DTE
+        # exit doesn't fill that fast, leave it (not urgent); it'll get
+        # picked up on the next cycle. If an SL market order doesn't fill
+        # fast, there's an upstream broker issue — log loudly.
+        try:
+            status = wait_for_order_fill(order_id, timeout_sec=8.0)
+        except Exception:
+            status = "unknown"
+        if is_sl_exit and status != "filled":
+            logger.error(f"SL market close {order_id} status={status} — broker issue, position may still be open")
+        pnl = state.close_multi_leg_position(key, current_value)
+        logger.info(f"MLEG CLOSED {pos.strategy} {pos.underlying} x{pos.unit_count} "
+                    f"@ net ${current_value:.2f} | P&L ${pnl:+.2f} | {reason} | order={order_id} status={status}")
 
     # ── 2. Entry scan ──────────────────────────────────────────────────────────
     spreads_on = cfg.get("spreads_enabled", False)
@@ -399,10 +646,18 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
         logger.info(f"Options daily cap ${max_daily} consumed — no new multi-leg entries.")
         return
 
-    # Budget per new trade: spread across up to 3 fresh picks
+    # Budget per new trade: spread across up to 3 fresh picks, AND cap any
+    # single trade to a fraction of the deployed-capital limit so a single
+    # bad entry can't wipe the options book (JPM-x5 lesson — one trade at
+    # 18% of deployed cap is too concentrated).
     open_count = len(state.multi_leg_positions)
     slots_left = max(1, 3 - open_count)
-    per_trade_budget = min(remaining, remaining / slots_left)
+    max_deployed = float(cfg.get("options_max_deployed_usd", 10000.0))
+    per_trade_pct = float(cfg.get("options_max_per_trade_pct", 0.15))
+    per_trade_hard_cap = max_deployed * per_trade_pct
+    per_trade_budget = min(remaining, remaining / slots_left, per_trade_hard_cap)
+    logger.info(f"Multi-leg per-trade budget: ${per_trade_budget:.0f} "
+                f"(remaining ${remaining:.0f} · slots {slots_left} · hard-cap ${per_trade_hard_cap:.0f})")
 
     watchlist = get_regime_watchlist(regime)
     open_underlyings = {p.underlying for p in state.multi_leg_positions.values()}
@@ -515,8 +770,10 @@ def refresh_dynamic_watchlist(state: BotState, force: bool = False) -> bool:
         logger.warning(f"build_daily_watchlist failed: {e}")
         return False
 
+    from datetime import datetime as _dt, timezone as _tz
     state.dynamic_watchlist = picks
     state.dynamic_watchlist_date = today
+    state.dynamic_watchlist_refreshed_at = _dt.now(_tz.utc).isoformat()
     state.save()
     if picks:
         sources = {}
@@ -628,10 +885,15 @@ def intraday_execute_phase(detector: RegimeDetector, state: BotState, regime: in
 
     # ── 1. EOD force-flatten all intraday positions ────────────────────────────
     if is_force_close_window(fc_hour, fc_min):
+        from executor.order_executor import cancel_order as _cancel_order
         flatten_count = 0
         for key, pos in list(state.options_positions.items()):
             if not pos.intraday:
                 continue
+            # Cancel the broker-side OCO first so it doesn't fire on an
+            # already-closed position (would become an orphan naked sell).
+            if getattr(pos, "stop_order_id", ""):
+                _cancel_order(pos.stop_order_id)
             current_premium = _fetch_option_mid(pos.contract_symbol)
             if current_premium <= 0:
                 current_premium = max(pos.entry_premium * 0.5, 0.05)
@@ -706,10 +968,17 @@ def intraday_execute_phase(detector: RegimeDetector, state: BotState, regime: in
         if state.intraday_daily_spent + pick.total_cost > max_daily:
             continue
 
-        order_id = buy_option(pick.contract_symbol, pick.qty, pick.limit_price,
-                              regime_name=f"{regime_name} INTRADAY_ORB")
+        # Intraday positions are sensitive — attach a broker-side OCO
+        # (TP + SL) so protection doesn't depend on our 5-min polling cycle.
+        order_id = buy_option(
+            pick.contract_symbol, pick.qty, pick.limit_price,
+            regime_name=f"{regime_name} INTRADAY_ORB",
+            protective_tp_pct=tp, protective_sl_pct=sl,
+        )
         if not order_id:
             continue
+        from executor.order_executor import last_protection_order_id
+        stop_oid = last_protection_order_id()
         state.intraday_daily_spent += pick.total_cost
         state.options_positions[pick.contract_symbol] = OptionsPosition(
             contract_symbol=pick.contract_symbol,
@@ -722,6 +991,7 @@ def intraday_execute_phase(detector: RegimeDetector, state: BotState, regime: in
             regime_at_entry=regime_name,
             strategy="intraday_orb",
             intraday=True,
+            stop_order_id=stop_oid,
         )
         state.save()
         logger.info(f"INTRADAY OPENED {pick.contract_symbol} x{pick.qty} "
@@ -883,9 +1153,29 @@ def main_loop():
     state = BotState.load()
     detector = RegimeDetector.load()
 
+    # Seed peak_equity from broker baseline so the drawdown circuit breaker
+    # never starts measuring against a snapshot we happened to take while
+    # already drawn-down. Ratcheting continues as usual from here.
+    try:
+        from executor.order_executor import get_account_baseline
+        broker_baseline = get_account_baseline()
+        if broker_baseline > state.peak_equity:
+            logger.info(f"peak_equity seeded from broker: ${state.peak_equity:.2f} → ${broker_baseline:.2f}")
+            state.peak_equity = broker_baseline
+            state.save()
+    except Exception as e:
+        logger.warning(f"broker baseline seed failed: {e}")
+
     # Initial train if no saved model
     if detector.model is None:
         detector = train_phase(detector)
+
+    # Regime cache — during intraday mode we skip the HMM recompute on most
+    # cycles since regime shifts rarely occur within a session. Peak-drawdown
+    # check still fires every cycle (it's cheap). Default 30 min between HMM
+    # recomputes; override via runtime.hmm_cache_min_intraday.
+    last_regime: Optional[int] = None
+    last_regime_ts: Optional[datetime] = None
 
     while True:
         cfg = rc.load()
@@ -905,6 +1195,20 @@ def main_loop():
             write_heartbeat(state, regime=-1, regime_name="lockout", mode="halted")
             time.sleep(60)
             continue
+
+        # On the very first cycle, watchlist refresh + broker reconcile can
+        # take a few minutes; write an "initializing" heartbeat so the
+        # dashboard doesn't show the prior run's stale timestamp. Later
+        # cycles already have a fresh end-of-cycle heartbeat to carry.
+        if state.cycles == 0:
+            write_heartbeat(state, regime=-1, regime_name="initializing", mode="initializing")
+
+        # Per-cycle broker reconcile — Alpaca is source of truth. Adopts
+        # orphans, prunes stale entries, stamps last_broker_sync_at.
+        try:
+            reconcile_from_broker(state)
+        except Exception as e:
+            logger.warning(f"reconcile_from_broker failed: {e}")
 
         # Pre-market daily hook: refresh dynamic watchlist once per day.
         # Runs regardless of market-open gate since the screener works pre-market.
@@ -929,7 +1233,31 @@ def main_loop():
                     portfolio_value = state.peak_equity or 100000.0
             except Exception:
                 portfolio_value = state.peak_equity or 100000.0
-            regime = monitor_phase(detector, state, portfolio_value)
+
+            # HMM monitoring: skip during intraday mode if the last run is
+            # fresh enough. Drawdown check still runs every cycle below.
+            intraday_active = cfg.get("intraday_enabled", False) and is_market_open()
+            hmm_cache_min = int(cfg.get("hmm_cache_min_intraday", 30))
+            now_utc = datetime.now(timezone.utc)
+            cache_fresh = (
+                intraday_active
+                and last_regime is not None
+                and last_regime_ts is not None
+                and (now_utc - last_regime_ts).total_seconds() / 60 < hmm_cache_min
+            )
+            if cache_fresh:
+                regime = last_regime
+                age_min = (now_utc - last_regime_ts).total_seconds() / 60
+                logger.info(f"HMM cached: regime={regime} ({detector.regime_name(regime)}) "
+                            f"· last run {age_min:.1f}m ago · next in {hmm_cache_min - age_min:.1f}m")
+                # Keep the cheap safety check running every cycle
+                if RiskManager.check_peak_drawdown(portfolio_value, state):
+                    logger.critical("Peak drawdown lockout triggered. Exiting.")
+                    sys.exit(1)
+            else:
+                regime = monitor_phase(detector, state, portfolio_value)
+                last_regime = regime
+                last_regime_ts = now_utc
 
             if stocks_on:
                 execute_phase(detector, state, regime, portfolio_value)

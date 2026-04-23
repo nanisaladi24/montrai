@@ -66,3 +66,29 @@ class BrokerBase(ABC):
         regime_name: str = "",
     ) -> Optional[str]:
         raise NotImplementedError("Broker does not support multi-leg orders")
+
+    # ── Account history (for dashboard perf charts) ──────────────────────────
+    def get_portfolio_history(self, period: str, timeframe: str) -> dict:
+        """Return {timestamps, equity, profit_loss, profit_loss_pct, base_value}.
+
+        period: "1D" | "1W" | "1M" | "3M" | "6M" | "1A" | "all"
+        timeframe: "1Min" | "5Min" | "15Min" | "1H" | "1D"
+        """
+        raise NotImplementedError("Broker does not expose portfolio history")
+
+    # ── Order lifecycle (stale cleanup + fill polling) ───────────────────────
+    def cancel_stale_orders(self, max_age_seconds: int = 180) -> int:
+        return 0
+
+    def wait_for_order_fill(self, order_id: str, timeout_sec: float = 8.0, poll_sec: float = 0.5) -> str:
+        return "unknown"
+
+    def get_account_baseline(self) -> float:
+        """Authoritative peak-equity for drawdown calc.
+
+        Should return max(starting_capital, historical_max_equity) so that
+        the bot's drawdown is always measured against a real high-water
+        mark (including post-deposit spikes), never against a snapshot the
+        bot happened to take while already drawn-down.
+        """
+        raise NotImplementedError("Broker does not expose account baseline")

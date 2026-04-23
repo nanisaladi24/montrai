@@ -26,11 +26,18 @@ Hard-coded in `risk/risk_manager.py`. Cannot be disabled by AI signal, strategy,
 | Circuit Breaker | Trigger | Effect |
 |---|---|---|
 | Options daily cap | Premium outlay exceeds **$1,000/day** | Trade blocked or trimmed |
+| Options deployed cap | Total cost-basis + capital-at-risk exceeds **$10,000** (rolling, no daily reset) | Trade blocked or trimmed until existing positions close |
 | Stock daily cap | Notional exceeds **$5,000/day** | Trade blocked or trimmed |
+| Stock deployed cap | Total notional exceeds **$50,000** (rolling, no daily reset) | Trade blocked or trimmed |
+| Per-trade sizing cap | Single MLEG trade tries to use >15% of deployed cap | Trade trimmed |
 | Intraday daily cap | Premium exceeds **$500/day** | Separate from swing cap |
 | Daily loss halt | Portfolio drops **2%** from day open | Position sizes halved rest of day |
-| Peak drawdown lockout | Portfolio drops **10%** from all-time high | Writes `LOCKOUT` file, bot exits, manual restart |
-| Per-option stops | Premium ±50% (long) / premium doubled (short credit) | Position closed |
+| Peak drawdown lockout | Portfolio drops **10%** from all-time high (seeded from Alpaca baseline) | Writes `LOCKOUT` file, bot exits, manual restart |
+| Per-option stops | Premium ±50% (long) / premium doubled (short credit) | Position closed (market order on SL for fast fill) |
+| Orphan emergency SL | Reconciled orphan credit spread reaches 75% of wing width | Position force-closed despite untrusted entry |
+| Stale-order auto-cancel | Open order unfilled for >3 min | Cancelled before next submission to prevent "held_for_orders" lockout |
+| Intraday broker-side OCO | Every intraday ORB open | TP + SL submitted as paired OCO at broker — no 5-min polling dependency |
+| Iron condor regime filter | Regime is euphoria or panic | Iron condor entries skipped (IC loses max in trending/vol-expansion regimes) |
 | Intraday force flatten | **15:55 ET** daily | All intraday positions closed regardless of P&L |
 
 ## Architecture

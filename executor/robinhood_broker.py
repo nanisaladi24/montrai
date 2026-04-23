@@ -232,8 +232,18 @@ class RobinhoodBroker(BrokerBase):
             )
             order_id = (order or {}).get("id", "unknown")
             leg_desc = " / ".join(f"{l['action']} {l['optionType']} {l['strike']}" for l in rh_legs)
-            log_trade(strategy or "MLEG", "MLEG", qty, net_limit_price,
-                      f"{order_side}_{strategy}", regime_name, order_id)
+            log_trade(underlying or (strategy or "MLEG"), "MLEG", qty, net_limit_price,
+                      f"{order_side}_{strategy}", regime_name, order_id,
+                      strategy=strategy or "")
+            try:
+                from core.orders_ledger import record_multi_leg_submission
+                record_multi_leg_submission(
+                    order_id=order_id, strategy=strategy or "",
+                    underlying=underlying or "", legs=legs, qty=qty,
+                    net_limit_price=net_limit_price, order_side=order_side,
+                )
+            except Exception as e:
+                logger.warning(f"ledger record failed: {e}")
             logger.info(f"MLEG {strategy} x{qty} @ net ${net_limit_price:.2f} ({credit_or_debit}): "
                         f"{leg_desc} → {order_id}")
             return order_id

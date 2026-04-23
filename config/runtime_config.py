@@ -28,6 +28,9 @@ from config.settings import (
     INTRADAY_ENABLED,
     STOCK_MAX_DAILY_USD,
     OPTIONS_MAX_DAILY_USD,
+    OPTIONS_MAX_DEPLOYED_USD,
+    STOCK_MAX_DEPLOYED_USD,
+    OPTIONS_MAX_PER_TRADE_PCT,
     OPTIONS_TAKE_PROFIT_PCT,
     OPTIONS_STOP_LOSS_PCT,
     OPTIONS_MIN_DTE_EXIT,
@@ -90,8 +93,11 @@ _DEFAULTS: dict[str, Any] = {
     "stock_trading_enabled":   STOCK_TRADING_ENABLED,
     "options_trading_enabled": OPTIONS_TRADING_ENABLED,
     "intraday_enabled":        INTRADAY_ENABLED,
-    "stock_max_daily_usd":     STOCK_MAX_DAILY_USD,
-    "options_max_daily_usd":   OPTIONS_MAX_DAILY_USD,
+    "stock_max_daily_usd":       STOCK_MAX_DAILY_USD,
+    "options_max_daily_usd":     OPTIONS_MAX_DAILY_USD,
+    "options_max_deployed_usd":  OPTIONS_MAX_DEPLOYED_USD,   # deployed-capital cap (no daily reset)
+    "stock_max_deployed_usd":    STOCK_MAX_DEPLOYED_USD,     # deployed-capital cap (no daily reset)
+    "options_max_per_trade_pct": OPTIONS_MAX_PER_TRADE_PCT,  # per-trade fraction of deployed cap
     # Options behavior
     "options_take_profit_pct": OPTIONS_TAKE_PROFIT_PCT,
     "options_stop_loss_pct":   OPTIONS_STOP_LOSS_PCT,

@@ -31,8 +31,10 @@ def test_runtime_config_exposes_new_keys():
         assert k in cfg, f"runtime config missing {k}"
 
 
-def test_default_trade_mode_is_options_only():
+def test_default_trade_mode_is_options_only(monkeypatch):
+    """Verify the *shipped* defaults — independent of local runtime.json overrides."""
     import config.runtime_config as rc
+    monkeypatch.setattr(rc, "load", lambda: dict(rc._DEFAULTS))
     cfg = rc.load()
     assert cfg["options_trading_enabled"] is True
     assert cfg["stock_trading_enabled"] is False
@@ -101,15 +103,17 @@ def test_short_option_exits():
 
 # ── Daily-cap independence ────────────────────────────────────────────────────
 
-def test_separate_stock_and_options_caps():
+def test_separate_stock_and_options_caps(monkeypatch):
     """Hitting the options cap must NOT block stock trades, and vice-versa."""
+    import config.runtime_config as rc
+    monkeypatch.setattr(rc, "load", lambda: dict(rc._DEFAULTS))
     from core.position_tracker import BotState
     from risk.risk_manager import RiskManager
     from datetime import date
 
     state = BotState()
     state.daily_date = date.today().isoformat()
-    state.options_daily_spent = 1000.0  # options cap fully consumed
+    state.options_daily_spent = 1000.0  # options cap fully consumed (default cap $1000)
     state.daily_spent = 0.0              # stock cap clean
 
     opt_verdict = RiskManager.check_options_daily_spend(state, 100.0)
@@ -118,13 +122,15 @@ def test_separate_stock_and_options_caps():
     assert stk_verdict.allowed, "Stock cap independence"
 
 
-def test_options_cap_trims_partial():
+def test_options_cap_trims_partial(monkeypatch):
+    import config.runtime_config as rc
+    monkeypatch.setattr(rc, "load", lambda: dict(rc._DEFAULTS))
     from core.position_tracker import BotState
     from risk.risk_manager import RiskManager
     from datetime import date
     state = BotState()
     state.daily_date = date.today().isoformat()
-    state.options_daily_spent = 900.0   # $100 remaining
+    state.options_daily_spent = 900.0   # $100 remaining against shipped $1000 default
     verdict = RiskManager.check_options_daily_spend(state, 250.0)
     assert verdict.allowed
     assert verdict.adjusted_dollars == pytest.approx(100.0)
@@ -529,8 +535,9 @@ def test_options_position_intraday_flag_roundtrip(tmp_path, monkeypatch):
     assert restored.intraday_daily_spent == 250.0
 
 
-def test_spread_config_exposed():
+def test_spread_config_exposed(monkeypatch):
     import config.runtime_config as rc
+    monkeypatch.setattr(rc, "load", lambda: dict(rc._DEFAULTS))
     cfg = rc.load()
     for k in ("spreads_enabled", "iron_condor_enabled",
               "spread_target_short_delta", "spread_wing_width",
