@@ -68,14 +68,13 @@ If the current commit changes any of the following, the relevant doc **must** be
 If no user-visible behavior changed (refactor, internal rename, test-only change), docs are allowed to stay as-is — but note this in the commit message so the reviewer knows it was intentional.
 
 ### 5. Commit message discipline
-Follow the existing commit style — descriptive multiline messages summarizing what changed and why. End with the Co-Authored-By trailer when Claude did the work:
+**Keep commit messages short.** Prefer a single-line title. Add body bullets only when they're genuinely non-obvious — 3 bullets max, one line each. No narrative paragraphs, no section headers, no exhaustive file lists. Readers can run `git show` for details.
 
 ```
-Short imperative title line
+Short imperative title under 70 chars
 
-Detailed bullet points of what changed and why:
-- Point 1
-- Point 2
+- Key bullet 1 (only when non-obvious)
+- Key bullet 2
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 ```
