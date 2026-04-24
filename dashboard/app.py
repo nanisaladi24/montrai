@@ -5,6 +5,8 @@ import streamlit as st
 import pandas as pd
 import json
 import os
+import signal
+import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -55,19 +57,38 @@ def trading_mode_banner():
         )
 
 
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ProcessLookupError, ValueError):
+        return False
+
+
 def bot_status_pill():
     """Read bot_heartbeat.json and render a status pill at the top of the page."""
     cfg = rc.load()
     interval = cfg.get("signal_interval_minutes", 30)
     hb_path = Path(HEARTBEAT_FILE)
     if not hb_path.exists():
-        return st.error("🔴 **Bot Stopped** — no heartbeat file found. Start with `python main.py`.")
+        return st.error("🔴 **Bot Stopped** — no heartbeat file found. Start with `python main.py` or use the Start button below.")
     try:
         hb = json.loads(hb_path.read_text())
     except Exception:
         return st.error("🔴 **Bot Stopped** — heartbeat file unreadable.")
 
-    # Staleness: allow up to 2× the configured interval plus a buffer.
+    pid = hb.get("pid")
+    # Authoritative: if the PID in the heartbeat is not alive, the bot is gone.
+    # Beats relying on a long staleness threshold (which made killed bots look
+    # asleep for up to an hour).
+    if not _pid_alive(pid):
+        return st.error(
+            f"🔴 **Bot Stopped** — pid {pid} is not running. Stale heartbeat will be cleared on next start."
+        )
+
+    # Staleness: the bot is alive but hasn't written a heartbeat recently.
     # Heartbeat writer emits tz-aware ISO strings — compare in UTC to avoid
     # naive-vs-aware subtraction errors.
     now = datetime.now(timezone.utc)
@@ -85,8 +106,8 @@ def bot_status_pill():
 
     if age_s > stale_threshold_s:
         return st.error(
-            f"🔴 **Bot Stopped** — last heartbeat {int(age_s)}s ago (pid {hb.get('pid','?')}). "
-            "Process may have crashed."
+            f"🔴 **Bot Unresponsive** — pid {pid} alive but last heartbeat {int(age_s)}s ago. "
+            "Process may be stuck."
         )
     if mode == "halted":
         return st.error(f"🟠 **Bot Halted (lockout)** — pid {hb.get('pid','?')}, last beat {int(age_s)}s ago.")
@@ -106,8 +127,57 @@ def bot_status_pill():
     )
 
 
+def bot_control_panel():
+    """Start/Stop buttons next to the status pill. Start launches main.py
+    detached so it survives dashboard reloads; Stop sends SIGTERM to the PID
+    in the heartbeat (main.py's signal handler cleans up the heartbeat)."""
+    repo_root = Path(__file__).parent.parent
+    hb_path = repo_root / HEARTBEAT_FILE
+    running_pid = None
+    if hb_path.exists():
+        try:
+            running_pid = int(json.loads(hb_path.read_text()).get("pid") or 0)
+        except Exception:
+            running_pid = None
+    is_running = bool(running_pid and _pid_alive(running_pid))
+
+    c1, c2, _ = st.columns([1, 1, 6])
+    if c1.button("▶ Start bot", disabled=is_running, help="Launch python main.py in the background."):
+        venv_python = repo_root / ".venv" / "bin" / "python"
+        py = str(venv_python) if venv_python.exists() else "python"
+        log_dir = repo_root / "logs"
+        log_dir.mkdir(exist_ok=True)
+        log_file = open(log_dir / "bot.log", "a")
+        try:
+            proc = subprocess.Popen(
+                [py, "main.py"],
+                cwd=str(repo_root),
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            st.success(f"Bot started (pid {proc.pid}). Log → logs/bot.log")
+        except Exception as e:
+            st.error(f"Failed to start bot: {e}")
+        st.rerun()
+    if c2.button("⏹ Stop bot", disabled=not is_running, help="Send SIGTERM to the running bot."):
+        try:
+            os.kill(running_pid, signal.SIGTERM)
+            st.success(f"Stop signal sent to pid {running_pid}.")
+        except ProcessLookupError:
+            st.warning(f"pid {running_pid} already gone — clearing stale heartbeat.")
+            try:
+                hb_path.unlink()
+            except FileNotFoundError:
+                pass
+        except Exception as e:
+            st.error(f"Failed to stop bot: {e}")
+        st.rerun()
+
+
 trading_mode_banner()
 bot_status_pill()
+bot_control_panel()
 
 tab_live, tab_options, tab_settings, tab_data = st.tabs(
     ["Live Dashboard", "Options", "Settings", "Data Sources"]

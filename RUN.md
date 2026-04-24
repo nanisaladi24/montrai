@@ -80,9 +80,15 @@ The dashboard is independent of the bot. You can start/stop it whenever.
 
 ## 3. Stopping cleanly
 
-In either terminal: **Ctrl-C**.
+Three equivalent ways to stop the bot:
 
-The bot's Ctrl-C handler saves state to `bot_state.json` before exiting. Open positions remain open at the broker — they'll be picked up again on next start.
+- **Ctrl-C** in the bot terminal (SIGINT)
+- **Stop bot** button at the top of the dashboard (sends SIGTERM to the heartbeat PID)
+- `kill <pid>` from any shell (SIGTERM)
+
+All three trigger the same cleanup path: state is saved to `bot_state.json` and `bot_heartbeat.json` is removed so the dashboard immediately reflects "Stopped." Open positions remain open at the broker — they'll be picked up again on next start.
+
+To start the bot from the dashboard, click **▶ Start bot** (launches `python main.py` in the background, logs to `logs/bot.log`).
 
 **Rule of thumb:** if you hold open positions and the market is open, the bot should be running. Stops are evaluated in-process every cycle, not as bracket orders at the broker, so a stopped bot = no active stop-loss protection until you restart.
 

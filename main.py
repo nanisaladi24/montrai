@@ -9,8 +9,10 @@ Run modes:
   python main.py --train       # retrain HMM only
 """
 import argparse
+import atexit
 import json
 import os
+import signal
 import time
 import sys
 import pandas as pd
@@ -37,6 +39,48 @@ from monitoring.logger import get_logger
 logger = get_logger("main")
 
 HEARTBEAT_FILE = "bot_heartbeat.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _remove_heartbeat() -> None:
+    try:
+        os.remove(HEARTBEAT_FILE)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning(f"heartbeat cleanup: {e}")
+
+
+def _cleanup_stale_heartbeat_on_start() -> None:
+    """If a previous run left a heartbeat with a dead PID, remove it."""
+    try:
+        hb = json.loads(open(HEARTBEAT_FILE).read())
+        prev_pid = int(hb.get("pid", 0))
+    except Exception:
+        return
+    if prev_pid and prev_pid != os.getpid() and not _pid_alive(prev_pid):
+        logger.info(f"Removing stale heartbeat (pid {prev_pid} no longer alive)")
+        _remove_heartbeat()
+
+
+def _install_exit_handlers() -> None:
+    """Always delete the heartbeat file on exit, no matter how we die."""
+    atexit.register(_remove_heartbeat)
+    def _on_signal(signum, _frame):
+        logger.info(f"Received signal {signum}, shutting down.")
+        sys.exit(0)
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _on_signal)
+        except (ValueError, OSError):
+            pass
 
 
 def _parse_occ_symbol(occ: str) -> Optional[dict]:
@@ -1146,6 +1190,8 @@ def covered_call_phase(detector: RegimeDetector, state: BotState, regime: int, p
 
 def main_loop():
     logger.info(f"🚀 Montrai starting (mode={TRADING_MODE})")
+    _cleanup_stale_heartbeat_on_start()
+    _install_exit_handlers()
 
     if TRADING_MODE == "live":
         login()
