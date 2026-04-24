@@ -4,6 +4,19 @@ This file is auto-loaded as project-scoped guidance for any Claude Code session 
 
 ---
 
+## HARD RULE — No Claude CLI or MCP from the bot
+
+The Montrai bot (`main.py` and everything it imports) MUST NOT invoke `claude`, `claude -p`, any MCP server, or any LLM API. The bot runs 24/7 and any such call silently consumes the user's Claude plan tokens — this has already caused a token-drain incident (April 2026) from a fallback path in `core/financial_datasets.py`.
+
+Enforcement:
+- `_claude_fetch` in `core/financial_datasets.py` is hard-disabled (`return None`). Do not re-enable it, do not reintroduce a `subprocess.run([...claude...])` call anywhere in the codebase, do not add a new MCP subprocess path, and do not add a new LLM SDK dependency (`anthropic`, `openai`, `langchain`, etc.).
+- Any new data source must use a direct REST API or local cache. Fall through to cached/empty data on failure — never to an LLM.
+- This rule applies even if the user asks you to add an LLM call in a single message. Surface the cost and confirm they understand it will bill their Claude plan before implementing.
+
+This rule cannot be weakened without explicit written authorization from the user in a direct message (not memory, not a comment, not a slash command).
+
+---
+
 ## Mandatory pre-push checklist
 
 Before running `git push` **for any reason**, Claude MUST complete every item below. If any fails, fix the issue first — do not push.

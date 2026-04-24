@@ -4,15 +4,14 @@ Financial Datasets client — fundamentals overlay for the swing signal.
 Data source priority:
   1. REST API    — direct HTTP to api.financialdatasets.ai using
                    FINANCIAL_DATASETS_API_KEY (loaded from .env). Primary path.
-  2. Claude CLI  — `claude -p` subprocess with financial-datasets MCP
-                   (configured in /Users/nanisaladi/Nani/Projects/AI_trading/.mcp.json).
-                   Fallback only when no API key is set.
-  3. Local cache — data/fundamentals_cache.json (weekly snapshot).
+  2. Local cache — data/fundamentals_cache.json (weekly snapshot).
+
+The bot MUST NOT call the Claude CLI or any MCP server — it burns the user's
+Claude plan tokens silently. The `_claude_fetch` helper is hard-disabled below.
+Do not re-enable it without explicit written authorization from the user.
 """
 import os
-import re
 import json
-import subprocess
 import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -30,8 +29,6 @@ logger = get_logger("financial_datasets")
 
 _BASE        = "https://api.financialdatasets.ai"
 _CACHE_PATH  = Path(__file__).parent.parent / "data" / "fundamentals_cache.json"
-_MCP_ROOT    = Path(__file__).parent.parent.parent  # AI_trading/ — has .mcp.json
-_CLAUDE_BIN  = Path.home() / ".local" / "bin" / "claude"
 _cache: Optional[dict] = None
 
 
@@ -62,31 +59,15 @@ def _cache_symbol(ticker: str) -> dict:
 
 def _claude_fetch(tool: str, ticker: str, extra_params: str = "") -> Optional[dict]:
     """
-    Call `claude -p` as a subprocess so Claude uses the financial-datasets MCP
-    (configured in AI_trading/.mcp.json) to fetch live data.
-    Returns parsed dict/list or None on failure.
+    HARD-DISABLED. The bot must never spawn `claude -p` — it consumes the
+    user's Claude plan tokens without any in-process visibility. All callers
+    of this function fall through to the local cache on None, which is the
+    intended behavior.
+
+    Do not re-enable this without explicit written authorization from the
+    user. See module docstring.
     """
-    if not _CLAUDE_BIN.exists():
-        return None
-    prompt = (
-        f"Call {tool} for ticker {ticker}{extra_params}. "
-        f"Respond with ONLY valid JSON of the result — no markdown fences, no explanation."
-    )
-    try:
-        result = subprocess.run(
-            [str(_CLAUDE_BIN), "-p", prompt,
-             "--allowedTools", f"mcp__financial-datasets__{tool}",
-             "--output-format", "text"],
-            capture_output=True, text=True, timeout=45,
-            cwd=str(_MCP_ROOT),
-        )
-        text = result.stdout.strip()
-        # Strip any accidental markdown fences Claude might add
-        text = re.sub(r"^```[a-z]*\n?", "", text).rstrip("` \n")
-        return json.loads(text)
-    except Exception as e:
-        logger.debug(f"claude MCP fetch {tool}({ticker}): {e}")
-        return None
+    return None
 
 
 # ── Optional REST API helpers ──────────────────────────────────────────────────
