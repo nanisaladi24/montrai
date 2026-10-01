@@ -171,6 +171,8 @@ Everything is off by default. Flip toggles from the dashboard Settings tab — t
 | `spreads_enabled` | Vertical credit spreads (bull put credit, bear call credit) | OFF |
 | `iron_condor_enabled` | Iron condor when \|score\| < 0.3 AND regime ∈ {neutral, bull, bear} (euphoria/panic skipped) | OFF |
 | `iron_condor_allow_euphoria` | Paper-only override: also allow IC in euphoria regime. Hard-gated to paper mode in code — flag has no effect in live. | OFF |
+| `iron_condor_allow_bear` | Allow IC in BEAR regime. Off by default — BEAR has elevated realized vol so wings get breached more often. | OFF |
+| `max_positions_per_sector` | Correlation guard. Caps total stock + options + multi-leg positions sharing a sector (`SECTOR_MAP` in `config/settings.py`). | 2 |
 | `covered_call_enabled` | Write calls against held shares | OFF |
 | `intraday_enabled` | Opening Range Breakout strategy (5-min cycles) — every intraday open gets a broker-side OCO (TP + SL) | OFF |
 | `stock_trading_enabled` | Swing stock trades | OFF |

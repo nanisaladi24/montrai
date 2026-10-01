@@ -846,6 +846,14 @@ with tab_settings:
                                 value=bool(cfg.get("iron_condor_allow_euphoria", False)),
                                 help="Override the historical 'no IC in euphoria' rule. Hard-gated to paper mode "
                                      "in code — flipping this on in live trading is silently ignored.")
+        ic_bear = st.toggle("Allow IC in bear regime",
+                            value=bool(cfg.get("iron_condor_allow_bear", False)),
+                            help="BEAR regime has elevated realized vol → wings get breached more often. "
+                                 "Off by default. Flip on for research or when IV expansion compensates.")
+        sector_cap = st.number_input("Max positions per sector",
+                                     min_value=1, max_value=10, step=1,
+                                     value=int(cfg.get("max_positions_per_sector", 2)),
+                                     help="Correlation guard — caps stock + options + multi-leg positions per sector.")
     with sp2:
         sp_delta = st.slider("Spread short-leg Δ", min_value=0.10, max_value=0.45, step=0.05,
                              value=float(cfg.get("spread_target_short_delta", 0.30)))
@@ -1115,6 +1123,8 @@ with tab_settings:
             "spreads_enabled":           bool(sp_on),
             "iron_condor_enabled":       bool(ic_on),
             "iron_condor_allow_euphoria": bool(ic_euphoria),
+            "iron_condor_allow_bear":    bool(ic_bear),
+            "max_positions_per_sector":  int(sector_cap),
             "spread_target_short_delta": float(sp_delta),
             "spread_wing_width":         float(sp_width),
             "iron_condor_short_delta":   float(ic_delta),

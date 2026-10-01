@@ -1,6 +1,38 @@
 from typing import List, Dict
-from config.settings import MAX_POSITION_SIZE_PCT
+from config.settings import MAX_POSITION_SIZE_PCT, SECTOR_MAP
 import config.runtime_config as rc
+
+
+def symbol_sector(symbol: str) -> str:
+    """Return canonical sector for a ticker; 'other' for anything not mapped."""
+    return SECTOR_MAP.get(symbol.upper(), "other")
+
+
+def count_sector_positions(state, sector: str) -> int:
+    """Count open positions (stock + options + multi-leg) whose underlying maps
+    to the given sector. Used to enforce max_positions_per_sector."""
+    if sector == "other":
+        return 0  # 'other' is a catch-all — never gate on it
+    n = 0
+    for sym in getattr(state, "positions", {}):
+        if symbol_sector(sym) == sector:
+            n += 1
+    for pos in getattr(state, "options_positions", {}).values():
+        if symbol_sector(getattr(pos, "underlying", "")) == sector:
+            n += 1
+    for pos in getattr(state, "multi_leg_positions", {}).values():
+        if symbol_sector(getattr(pos, "underlying", "")) == sector:
+            n += 1
+    return n
+
+
+def sector_cap_blocks(state, symbol: str) -> bool:
+    """True if adding one more position on `symbol` would exceed the per-sector cap."""
+    sector = symbol_sector(symbol)
+    if sector == "other":
+        return False
+    cap = int(rc.load().get("max_positions_per_sector", 2))
+    return count_sector_positions(state, sector) >= cap
 
 
 def get_regime_watchlist(regime: int) -> List[str]:

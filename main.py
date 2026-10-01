@@ -26,7 +26,10 @@ from core.market_data import fetch_historical, latest_quote, is_market_open, cur
 from core.feature_engineering import build_hmm_features, swing_signal, add_indicators
 from core.position_tracker import BotState, Position, OptionsPosition, OptionLeg, MultiLegPosition
 from regime.hmm_engine import RegimeDetector
-from regime.strategies import get_regime_watchlist, compute_position_size, can_open_new_position
+from regime.strategies import (
+    get_regime_watchlist, compute_position_size, can_open_new_position,
+    sector_cap_blocks, symbol_sector,
+)
 from risk.risk_manager import RiskManager
 from executor.order_executor import (
     login, get_portfolio_value, get_cash,
@@ -385,11 +388,16 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
 
     watchlist = get_regime_watchlist(regime)
     score_threshold = rc.load().get("signal_score_threshold_long", 0.6)
-    skips = {"holding": 0, "no_data": 0, "low_score": 0, "no_quote": 0, "size": 0}
+    skips = {"holding": 0, "no_data": 0, "low_score": 0, "no_quote": 0, "size": 0, "sector_cap": 0}
     for symbol in watchlist:
         if symbol in state.positions:
             skips["holding"] += 1
             continue  # already holding
+
+        if sector_cap_blocks(state, symbol):
+            skips["sector_cap"] += 1
+            logger.info(f"Skip {symbol}: sector {symbol_sector(symbol)} already at cap")
+            continue
 
         df = fetch_historical(symbol, days=120)
         if df.empty or len(df) < 65:
@@ -523,11 +531,14 @@ def options_execute_phase(detector: RegimeDetector, state: BotState, regime: int
     short_thr = abs(cfg.get("signal_score_threshold_short", -0.6))
     score_thr = min(long_thr, short_thr)
     picks = []
-    skips = {"holding": 0, "no_data": 0, "low_score": 0, "no_pick": 0}
+    skips = {"holding": 0, "no_data": 0, "low_score": 0, "no_pick": 0, "sector_cap": 0}
     for symbol in watchlist:
         if any(op.underlying == symbol for op in state.options_positions.values()):
             skips["holding"] += 1
             continue  # already have exposure on this underlying
+        if sector_cap_blocks(state, symbol):
+            skips["sector_cap"] += 1
+            continue
         df = fetch_historical(symbol, days=120)
         if df.empty or len(df) < 65:
             skips["no_data"] += 1
@@ -738,10 +749,13 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
     spread_thr = min(long_thr, short_thr)
 
     picks: list = []
-    skips = {"holding": 0, "no_data": 0, "neutral": 0, "spread_no_pick": 0, "ic_no_pick": 0, "no_quote": 0}
+    skips = {"holding": 0, "no_data": 0, "neutral": 0, "spread_no_pick": 0, "ic_no_pick": 0, "no_quote": 0, "sector_cap": 0}
     for symbol in watchlist:
         if symbol in open_underlyings:
             skips["holding"] += 1
+            continue
+        if sector_cap_blocks(state, symbol):
+            skips["sector_cap"] += 1
             continue
         df = fetch_historical(symbol, days=120)
         if df.empty or len(df) < 65:

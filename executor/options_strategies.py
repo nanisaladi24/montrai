@@ -235,8 +235,11 @@ def select_iron_condor(
     (paper only) since euphoria's low realized vol + elevated IV is the textbook
     premium-selling setup."""
     rn = (regime_name or "").lower()
+    cfg = rc.load()
     allowed = set(_IC_ALLOWED_REGIMES)
-    if rn == "euphoria" and rc.load().get("iron_condor_allow_euphoria", False) and TRADING_MODE == "paper":
+    if not cfg.get("iron_condor_allow_bear", False):
+        allowed.discard("bear")
+    if rn == "euphoria" and cfg.get("iron_condor_allow_euphoria", False) and TRADING_MODE == "paper":
         allowed.add("euphoria")
     if rn not in allowed:
         logger.debug(f"IC skip {underlying}: regime={rn} not in {allowed}")

@@ -548,8 +548,39 @@ def test_spread_config_exposed(monkeypatch):
               "spread_target_short_delta", "spread_wing_width",
               "spread_take_profit_pct", "spread_stop_loss_pct",
               "iron_condor_short_delta", "iron_condor_wing_width",
-              "iron_condor_allow_euphoria"):
+              "iron_condor_allow_euphoria",
+              "iron_condor_allow_bear",
+              "max_positions_per_sector"):
         assert k in cfg, f"missing runtime config key: {k}"
     assert cfg["spreads_enabled"] is False  # opt-in default
     assert cfg["iron_condor_enabled"] is False
     assert cfg["iron_condor_allow_euphoria"] is False  # opt-in default
+    assert cfg["iron_condor_allow_bear"] is False      # BEAR vol breaches wings — opt-in
+    assert cfg["max_positions_per_sector"] == 2
+
+
+def test_sector_cap_blocks(tmp_path, monkeypatch):
+    """Opening a third bank-sector position must be blocked when cap=2."""
+    import config.runtime_config as rc
+    from regime.strategies import sector_cap_blocks, symbol_sector
+    import core.position_tracker as pt
+    monkeypatch.setattr(pt, "STATE_FILE", str(tmp_path / "bot_state.json"))
+    monkeypatch.setattr(rc, "load", lambda: {"max_positions_per_sector": 2})
+
+    assert symbol_sector("JPM") == "financial"
+    assert symbol_sector("BAC") == "financial"
+    assert symbol_sector("UNKNOWN_TICKER") == "other"
+
+    state = pt.BotState()
+    # No positions → nothing blocks
+    assert not sector_cap_blocks(state, "JPM")
+    # Two bank positions already → next bank blocked, non-bank passes
+    state.positions = {
+        "JPM": pt.Position(symbol="JPM", quantity=1, entry_price=100.0,
+                           entry_date="2026-01-01", stop_loss=90.0, take_profit=110.0),
+        "BAC": pt.Position(symbol="BAC", quantity=1, entry_price=50.0,
+                           entry_date="2026-01-01", stop_loss=45.0, take_profit=55.0),
+    }
+    assert sector_cap_blocks(state, "WFC")        # third financial → blocked
+    assert not sector_cap_blocks(state, "AAPL")   # different sector → fine
+    assert not sector_cap_blocks(state, "FOOBAR") # 'other' sector never gated

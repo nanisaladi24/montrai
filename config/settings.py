@@ -90,6 +90,36 @@ IRON_CONDOR_WING_WIDTH   = 5.0
 # premium during melt-up periods. Hard-gated to paper mode in
 # executor/options_strategies.py regardless of this value.
 IRON_CONDOR_ALLOW_EUPHORIA = os.getenv("IRON_CONDOR_ALLOW_EUPHORIA", "false").lower() == "true"
+# Allow iron condor in BEAR regime. BEAR has elevated realized vol — wings
+# get breached more often than in neutral/bull — so default OFF. Flip via
+# runtime.json for research or when IV expansion compensates.
+IRON_CONDOR_ALLOW_BEAR = os.getenv("IRON_CONDOR_ALLOW_BEAR", "false").lower() == "true"
+
+# Correlation cap: don't stack more than N positions in the same sector.
+# Counts stock + options + multi-leg positions whose underlying maps to the
+# same sector. Default 2 keeps "two bank longs + one bank IC" from happening.
+MAX_POSITIONS_PER_SECTOR = 2
+SECTOR_MAP: dict[str, str] = {
+    # Financial
+    "JPM": "financial", "BAC": "financial", "WFC": "financial", "C": "financial",
+    "GS": "financial", "MS": "financial", "SCHW": "financial", "BLK": "financial",
+    # Mega-cap tech
+    "AAPL": "tech", "MSFT": "tech", "GOOGL": "tech", "GOOG": "tech",
+    "META": "tech", "AMZN": "tech", "NFLX": "tech", "CRM": "tech",
+    # Semiconductors
+    "NVDA": "semi", "AMD": "semi", "INTC": "semi", "AVGO": "semi",
+    "TSM": "semi", "MU": "semi", "QCOM": "semi", "SMH": "semi", "SOXX": "semi",
+    "SOXS": "semi", "SOXL": "semi",
+    # Autos
+    "TSLA": "auto", "RIVN": "auto", "F": "auto", "GM": "auto", "TSLL": "auto",
+    # Energy
+    "XLE": "energy", "XOM": "energy", "CVX": "energy", "COP": "energy",
+    # Bonds / rates
+    "TLT": "bonds", "TBT": "bonds", "IEF": "bonds",
+    # Broad index ETFs
+    "SPY": "index", "QQQ": "index", "IWM": "index", "DIA": "index",
+    "TZA": "index", "TQQQ": "index", "SQQQ": "index",
+}
 
 # ── Covered Calls ──────────────────────────────────────────────────────────────
 # Writes short calls against 100-share lots of underlyings on the watchlist.
