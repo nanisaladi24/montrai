@@ -182,6 +182,8 @@ class BotState:
     intraday_daily_spent: float = 0.0         # intraday option premium today
     daily_date: str = ""
     peak_equity: float = 0.0
+    start_of_day_equity: float = 0.0   # Portfolio value seeded once per calendar day for daily-loss math
+    start_of_day_date: str = ""        # Date the above was seeded (ISO yyyy-mm-dd)
     is_halved: bool = False         # True when daily loss triggered halving
     total_realized_pnl: float = 0.0
     options_realized_pnl: float = 0.0
@@ -205,6 +207,18 @@ class BotState:
             self.daily_date = today
             self.is_halved = False
             logger.info("Daily counters reset for new trading day.")
+
+    def ensure_start_of_day(self, portfolio_value: float):
+        """Seed start-of-day equity once per calendar day from the live portfolio value.
+        This is what daily-loss math compares against (NOT peak_equity, which is the
+        all-time high and only ratchets up)."""
+        today = date.today().isoformat()
+        if self.start_of_day_date != today or self.start_of_day_equity <= 0:
+            self.start_of_day_equity = portfolio_value
+            self.start_of_day_date = today
+            self.is_halved = False
+            self.save()
+            logger.info(f"Start-of-day equity seeded: ${portfolio_value:,.2f}")
 
     def options_capital_deployed(self) -> float:
         """Sum cost-basis / capital-at-risk across all open option positions.
@@ -246,6 +260,8 @@ class BotState:
             "intraday_daily_spent": self.intraday_daily_spent,
             "daily_date": self.daily_date,
             "peak_equity": self.peak_equity,
+            "start_of_day_equity": self.start_of_day_equity,
+            "start_of_day_date": self.start_of_day_date,
             "is_halved": self.is_halved,
             "total_realized_pnl": self.total_realized_pnl,
             "options_realized_pnl": self.options_realized_pnl,
@@ -271,6 +287,8 @@ class BotState:
             state.intraday_daily_spent = data.get("intraday_daily_spent", 0.0)
             state.daily_date = data.get("daily_date", "")
             state.peak_equity = data.get("peak_equity", 0.0)
+            state.start_of_day_equity = data.get("start_of_day_equity", 0.0)
+            state.start_of_day_date = data.get("start_of_day_date", "")
             state.is_halved = data.get("is_halved", False)
             state.total_realized_pnl = data.get("total_realized_pnl", 0.0)
             state.options_realized_pnl = data.get("options_realized_pnl", 0.0)

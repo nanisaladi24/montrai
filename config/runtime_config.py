@@ -69,6 +69,7 @@ from config.settings import (
     SPREAD_MIN_CREDIT,
     IRON_CONDOR_SHORT_DELTA,
     IRON_CONDOR_WING_WIDTH,
+    IRON_CONDOR_ALLOW_EUPHORIA,
 )
 
 _RUNTIME_FILE = Path(__file__).parent / "runtime.json"
@@ -121,6 +122,7 @@ _DEFAULTS: dict[str, Any] = {
     "spread_min_credit":            SPREAD_MIN_CREDIT,
     "iron_condor_short_delta":      IRON_CONDOR_SHORT_DELTA,
     "iron_condor_wing_width":       IRON_CONDOR_WING_WIDTH,
+    "iron_condor_allow_euphoria":   IRON_CONDOR_ALLOW_EUPHORIA,
     # Dynamic daily watchlist
     "dynamic_watchlist_enabled":   DYNAMIC_WATCHLIST_ENABLED,
     "dynamic_watchlist_limit":     DYNAMIC_WATCHLIST_LIMIT,

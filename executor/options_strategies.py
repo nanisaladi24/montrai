@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 import config.runtime_config as rc
+from config.settings import TRADING_MODE
 from core.options_data import (
     OptionContract, get_option_chain, pick_contract,
     pick_vertical_spread, pick_iron_condor, net_premium,
@@ -230,10 +231,15 @@ def select_iron_condor(
     """Iron condor for neutral / range-bound setups. Fires when conviction is
     low (|score| < 0.3) AND regime is moderate-vol (not euphoria/panic).
     Euphoria and panic move past the wings; iron condors lose max in those
-    regimes."""
+    regimes — except euphoria can be opted-in via iron_condor_allow_euphoria
+    (paper only) since euphoria's low realized vol + elevated IV is the textbook
+    premium-selling setup."""
     rn = (regime_name or "").lower()
-    if rn not in _IC_ALLOWED_REGIMES:
-        logger.debug(f"IC skip {underlying}: regime={rn} not in {_IC_ALLOWED_REGIMES}")
+    allowed = set(_IC_ALLOWED_REGIMES)
+    if rn == "euphoria" and rc.load().get("iron_condor_allow_euphoria", False) and TRADING_MODE == "paper":
+        allowed.add("euphoria")
+    if rn not in allowed:
+        logger.debug(f"IC skip {underlying}: regime={rn} not in {allowed}")
         return None
     if abs(score) >= 0.30:
         return None  # Directional — let spread/long-option path handle it

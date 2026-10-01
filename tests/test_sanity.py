@@ -199,8 +199,12 @@ def test_bot_state_roundtrip_with_options(tmp_path, monkeypatch):
 # ── Polygon client configuration ──────────────────────────────────────────────
 
 def test_polygon_key_configured():
+    """Polygon is optional. If the key is set, is_configured() must agree;
+    if it's absent, the client must advertise itself as not configured so
+    callers fall back to Alpaca-only data without crashing."""
+    import os
     from core.polygon_client import is_configured
-    assert is_configured(), "POLYGON_API_KEY must be in .env for live data"
+    assert is_configured() == bool(os.getenv("POLYGON_API_KEY", "").strip())
 
 
 # ── Multi-leg spread math ─────────────────────────────────────────────────────
@@ -461,8 +465,9 @@ def test_get_regime_watchlist_skips_dynamic_in_defensive_regimes(tmp_path, monke
 
 # ── Intraday ORB + threshold knobs ────────────────────────────────────────────
 
-def test_threshold_config_exposed():
+def test_threshold_config_exposed(monkeypatch):
     import config.runtime_config as rc
+    monkeypatch.setattr(rc, "load", lambda: dict(rc._DEFAULTS))
     cfg = rc.load()
     for k in ("signal_score_threshold_long", "signal_score_threshold_short",
               "paper_force_top_score",
@@ -542,7 +547,9 @@ def test_spread_config_exposed(monkeypatch):
     for k in ("spreads_enabled", "iron_condor_enabled",
               "spread_target_short_delta", "spread_wing_width",
               "spread_take_profit_pct", "spread_stop_loss_pct",
-              "iron_condor_short_delta", "iron_condor_wing_width"):
+              "iron_condor_short_delta", "iron_condor_wing_width",
+              "iron_condor_allow_euphoria"):
         assert k in cfg, f"missing runtime config key: {k}"
     assert cfg["spreads_enabled"] is False  # opt-in default
     assert cfg["iron_condor_enabled"] is False
+    assert cfg["iron_condor_allow_euphoria"] is False  # opt-in default

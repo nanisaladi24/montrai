@@ -375,9 +375,8 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
                 logger.info(f"CLOSED {symbol} @ ${price:.2f} | P&L ${pnl:+.2f} | reason: {reason}")
 
     # ── 2. Daily loss check ─────────────────────────────────────────────────
-    # Use today's starting value approximation from state
-    start_val = state.peak_equity or portfolio_value
-    RiskManager.check_daily_loss(portfolio_value, start_val, state)
+    state.ensure_start_of_day(portfolio_value)
+    RiskManager.check_daily_loss(portfolio_value, state.start_of_day_equity, state)
 
     # ── 3. Scan for entries ─────────────────────────────────────────────────
     if not can_open_new_position(len(state.positions), regime):
@@ -385,20 +384,26 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
         return
 
     watchlist = get_regime_watchlist(regime)
+    score_threshold = rc.load().get("signal_score_threshold_long", 0.6)
+    skips = {"holding": 0, "no_data": 0, "low_score": 0, "no_quote": 0, "size": 0}
     for symbol in watchlist:
         if symbol in state.positions:
+            skips["holding"] += 1
             continue  # already holding
 
         df = fetch_historical(symbol, days=120)
         if df.empty or len(df) < 65:
+            skips["no_data"] += 1
             continue
 
         signal = swing_signal(df, symbol=symbol)
-        if signal["score"] < 0.6:
+        if signal["score"] < score_threshold:
+            skips["low_score"] += 1
             continue
 
         price = latest_quote(symbol)
         if not price or price <= 0:
+            skips["no_quote"] += 1
             continue
 
         atr_pct = signal["last"].get("atr_pct", 0.02)
@@ -406,6 +411,7 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
             regime, portfolio_value, signal["score"], atr_pct, state.is_halved
         )
         if dollars < 1.0:
+            skips["size"] += 1
             logger.info(f"Skip {symbol}: position size too small (${dollars:.2f})")
             continue
 
@@ -436,6 +442,12 @@ def execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfo
 
         if not can_open_new_position(len(state.positions), regime):
             break   # max positions reached
+
+    if any(skips.values()):
+        logger.info(
+            f"Stock entry scan ({len(watchlist)} symbols, threshold {score_threshold:.2f}): "
+            + ", ".join(f"{k}={v}" for k, v in skips.items() if v)
+        )
 
 
 def options_execute_phase(detector: RegimeDetector, state: BotState, regime: int, portfolio_value: float):
@@ -490,8 +502,8 @@ def options_execute_phase(detector: RegimeDetector, state: BotState, regime: int
                         f"P&L ${pnl:+.2f} | reason: {reason}")
 
     # ── 2. Daily-loss / drawdown-halving still applies (shared counter) ────────
-    start_val = state.peak_equity or portfolio_value
-    RiskManager.check_daily_loss(portfolio_value, start_val, state)
+    state.ensure_start_of_day(portfolio_value)
+    RiskManager.check_daily_loss(portfolio_value, state.start_of_day_equity, state)
 
     # ── 3. Entry scan — directional calls/puts only in Phase 1 ─────────────────
     cfg = rc.load()
@@ -507,21 +519,36 @@ def options_execute_phase(detector: RegimeDetector, state: BotState, regime: int
     per_trade_budget = min(remaining, remaining / slots_left)
 
     # Score every candidate first so we allocate budget to the strongest signals
+    long_thr  = abs(cfg.get("signal_score_threshold_long", 0.6))
+    short_thr = abs(cfg.get("signal_score_threshold_short", -0.6))
+    score_thr = min(long_thr, short_thr)
     picks = []
+    skips = {"holding": 0, "no_data": 0, "low_score": 0, "no_pick": 0}
     for symbol in watchlist:
         if any(op.underlying == symbol for op in state.options_positions.values()):
+            skips["holding"] += 1
             continue  # already have exposure on this underlying
         df = fetch_historical(symbol, days=120)
         if df.empty or len(df) < 65:
+            skips["no_data"] += 1
             continue
         sig = swing_signal(df, symbol=symbol)
         score = sig.get("score", 0.0)
-        if abs(score) < 0.6:
+        if abs(score) < score_thr:
+            skips["low_score"] += 1
             continue
         pick = select_trade(symbol, score, regime_name, per_trade_budget)
         if pick is None:
+            skips["no_pick"] += 1
             continue
         picks.append(pick)
+
+    if any(skips.values()) or not picks:
+        logger.info(
+            f"Options entry scan ({len(watchlist)} symbols, |score|≥{score_thr:.2f}): "
+            f"picks={len(picks)} | "
+            + ", ".join(f"{k}={v}" for k, v in skips.items() if v)
+        )
 
     picks.sort(key=lambda p: abs(p.score), reverse=True)
 
@@ -706,28 +733,48 @@ def multi_leg_execute_phase(detector: RegimeDetector, state: BotState, regime: i
     watchlist = get_regime_watchlist(regime)
     open_underlyings = {p.underlying for p in state.multi_leg_positions.values()}
 
+    long_thr  = abs(cfg.get("signal_score_threshold_long", 0.6))
+    short_thr = abs(cfg.get("signal_score_threshold_short", -0.6))
+    spread_thr = min(long_thr, short_thr)
+
     picks: list = []
+    skips = {"holding": 0, "no_data": 0, "neutral": 0, "spread_no_pick": 0, "ic_no_pick": 0, "no_quote": 0}
     for symbol in watchlist:
         if symbol in open_underlyings:
+            skips["holding"] += 1
             continue
         df = fetch_historical(symbol, days=120)
         if df.empty or len(df) < 65:
+            skips["no_data"] += 1
             continue
         sig = swing_signal(df, symbol=symbol)
         score = sig.get("score", 0.0)
 
-        if spreads_on and abs(score) >= 0.6:
+        if spreads_on and abs(score) >= spread_thr:
             pick = select_spread_trade(symbol, score, regime_name, per_trade_budget)
             if pick:
                 picks.append(pick)
                 continue
+            skips["spread_no_pick"] += 1
         if ic_on and abs(score) < 0.30:
             spot = latest_quote(symbol)
             if not spot:
+                skips["no_quote"] += 1
                 continue
             pick = select_iron_condor(symbol, score, regime_name, spot, per_trade_budget)
             if pick:
                 picks.append(pick)
+                continue
+            skips["ic_no_pick"] += 1
+        if abs(score) < spread_thr and not (ic_on and abs(score) < 0.30):
+            skips["neutral"] += 1
+
+    if any(skips.values()) or not picks:
+        logger.info(
+            f"Multi-leg entry scan ({len(watchlist)} symbols, spread |score|≥{spread_thr:.2f}, IC |score|<0.30): "
+            f"picks={len(picks)} | "
+            + ", ".join(f"{k}={v}" for k, v in skips.items() if v)
+        )
 
     picks.sort(key=lambda p: abs(p.score), reverse=True)
 

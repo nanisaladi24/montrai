@@ -62,6 +62,29 @@ def test_compute_stops():
     assert abs(target - 100.0 * (1 + TAKE_PROFIT_PCT)) < 0.01
 
 
+def test_ensure_start_of_day_seeds_from_portfolio_not_peak(tmp_path, monkeypatch):
+    """Daily-loss baseline must be today's start-of-day equity, not the all-time peak.
+    Using peak_equity would re-trigger halving every day until a new high prints."""
+    import core.position_tracker as pt
+    monkeypatch.setattr(pt, "STATE_FILE", str(tmp_path / "bot_state.json"))
+    state = BotState()
+    state.peak_equity = 100_000.0
+    state.ensure_start_of_day(97_000.0)
+    assert state.start_of_day_equity == 97_000.0
+    halted = RiskManager.check_daily_loss(97_000.0, state.start_of_day_equity, state)
+    assert not halted
+    assert not state.is_halved
+
+
+def test_ensure_start_of_day_idempotent_within_day(tmp_path, monkeypatch):
+    import core.position_tracker as pt
+    monkeypatch.setattr(pt, "STATE_FILE", str(tmp_path / "bot_state.json"))
+    state = BotState()
+    state.ensure_start_of_day(100_000.0)
+    state.ensure_start_of_day(95_000.0)
+    assert state.start_of_day_equity == 100_000.0
+
+
 def test_peak_drawdown_creates_lockout(tmp_path, monkeypatch):
     import config.settings as cfg
     monkeypatch.setattr(cfg, "LOCKOUT_FILE", str(tmp_path / "LOCKOUT"))

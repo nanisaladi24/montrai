@@ -8,7 +8,7 @@ import os
 import signal
 import subprocess
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -417,9 +417,18 @@ with tab_live:
     dd_pct_live = ((peak - live_eq) / peak * 100) if (peak > 0 and live_eq > 0) else 0.0
     dd_frac_of_limit = (dd_pct_live / 100) / dd_lockout_pct if dd_lockout_pct > 0 else 0.0
 
-    # Intraday loss vs halving threshold (approximate — uses peak as proxy for start-of-day)
-    sod_loss_pct = dd_pct_live  # same proxy — the bot uses SOD equity at cycle start internally
-    halt_frac = (sod_loss_pct / 100) / daily_halt_pct if daily_halt_pct > 0 else 0.0
+    # Intraday loss vs halving threshold — matches risk_manager.check_daily_loss exactly:
+    # uses state.start_of_day_equity (seeded once per calendar day) as the baseline.
+    sod_eq = float(state_data.get("start_of_day_equity", 0) or 0)
+    sod_date = str(state_data.get("start_of_day_date", ""))
+    today_iso = date.today().isoformat()
+    sod_valid = sod_date == today_iso and sod_eq > 0 and live_eq > 0
+    if sod_valid:
+        sod_loss_pct = max(0.0, (sod_eq - live_eq) / sod_eq * 100)
+        halt_frac = (sod_loss_pct / 100) / daily_halt_pct if daily_halt_pct > 0 else 0.0
+    else:
+        sod_loss_pct = 0.0
+        halt_frac = 0.0
 
     # Fractions for progress bars
     opt_frac   = min(opt_spent_now / max(opt_cap_now, 1), 1.0)
@@ -453,11 +462,19 @@ with tab_live:
 
     with cb3:
         tripped = bool(state_data.get("is_halved", False))
-        label = "🔴 HALVED" if tripped else _status_emoji(min(halt_frac, 1.0))
+        if tripped:
+            label = "🔴 HALVED"
+        elif not sod_valid:
+            label = "⚪ awaiting SOD"
+        else:
+            label = _status_emoji(min(halt_frac, 1.0))
         st.markdown(f"**Daily Loss Halt** · {label}")
         st.progress(min(max(halt_frac, 0), 1.0),
-                    text=f"intraday loss vs halt @ {daily_halt_pct:.1%}")
-        st.caption("Triggering this halves position size for the rest of the day")
+                    text=f"{sod_loss_pct:.2f}% intraday loss · halt @ {daily_halt_pct:.1%}")
+        if sod_valid:
+            st.caption(f"SOD ${sod_eq:,.0f} → live ${live_eq:,.0f} · halving triggers at the threshold")
+        else:
+            st.caption("Start-of-day equity not seeded yet — first bot cycle of the trading day will set it")
 
     # ── Row 2: flow/usage breakers ───────────────────────────────────────────
     cb4, cb5, cb6 = st.columns(3)
@@ -825,6 +842,10 @@ with tab_settings:
                           help="Bull-put / bear-call credit spreads (defined-risk directional).")
         ic_on = st.toggle("Iron condor", value=bool(cfg.get("iron_condor_enabled", False)),
                           help="Neutral strategy. Fires when |score| < 0.3 — collects premium on chop.")
+        ic_euphoria = st.toggle("Allow IC in euphoria (paper only)",
+                                value=bool(cfg.get("iron_condor_allow_euphoria", False)),
+                                help="Override the historical 'no IC in euphoria' rule. Hard-gated to paper mode "
+                                     "in code — flipping this on in live trading is silently ignored.")
     with sp2:
         sp_delta = st.slider("Spread short-leg Δ", min_value=0.10, max_value=0.45, step=0.05,
                              value=float(cfg.get("spread_target_short_delta", 0.30)))
@@ -1093,6 +1114,7 @@ with tab_settings:
             "covered_call_target_dte_max": int(cc_dte_max),
             "spreads_enabled":           bool(sp_on),
             "iron_condor_enabled":       bool(ic_on),
+            "iron_condor_allow_euphoria": bool(ic_euphoria),
             "spread_target_short_delta": float(sp_delta),
             "spread_wing_width":         float(sp_width),
             "iron_condor_short_delta":   float(ic_delta),

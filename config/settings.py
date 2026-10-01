@@ -85,6 +85,11 @@ SPREAD_STOP_LOSS_PCT     = 0.50     # Close at 50% loss (of debit) / 2× credit 
 SPREAD_MIN_CREDIT        = 0.20     # Skip if credit < $0.20 per spread (not worth slippage)
 IRON_CONDOR_SHORT_DELTA  = 0.15     # Wider OTM for condors — lower assignment risk
 IRON_CONDOR_WING_WIDTH   = 5.0
+# Allow iron condor in EUPHORIA regime (paper only). Codebase historically
+# excluded euphoria from IC eligibility; flipping this lets the bot sell
+# premium during melt-up periods. Hard-gated to paper mode in
+# executor/options_strategies.py regardless of this value.
+IRON_CONDOR_ALLOW_EUPHORIA = os.getenv("IRON_CONDOR_ALLOW_EUPHORIA", "false").lower() == "true"
 
 # ── Covered Calls ──────────────────────────────────────────────────────────────
 # Writes short calls against 100-share lots of underlyings on the watchlist.
